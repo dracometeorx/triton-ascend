@@ -567,7 +567,7 @@ void populateBuiltinGraphOptimizationRules(
   if (gatherTarget &&
       isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::GatherOptimization)) {
-    rules.push_back(createGatherOptimizationRule());
+    rules.push_back(createGatherOptimizationRule(options.ubCapacityBytes));
   }
   const auto compileMode =
       triton::ascend::parseCompileMode(options.compileMode);
