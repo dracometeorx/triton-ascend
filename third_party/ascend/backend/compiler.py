@@ -1052,11 +1052,6 @@ class NPUOptions:
     enable_graph_optimize: bool = True
     # 1023 = all 10 rules, GatherOptimization (bit 512) included.
     graph_optimize_rule_mask: int = 1023
-    graph_optimize_max_rewrites_per_function: int = 64
-    graph_optimize_ub_capacity_bytes: Optional[int] = None
-    graph_optimize_emit_remarks: bool = False
-    allow_fp8e4nv: bool = False
-    auto_tile_and_bind_subblock: bool = True
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15", "fp8e4nv", "fp8e4b8", "fp8e5b16")
     deprecated_fp8_dtypes: Tuple[str] = ()
     vf_merge_level: int = 1

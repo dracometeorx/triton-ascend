@@ -547,27 +547,33 @@ def _run_make_ttir_with_recorded_graph_options(compiler, monkeypatch, options):
     return events, graph_calls
 
 
-def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_module, monkeypatch):
+@pytest.mark.parametrize("rule_mask", [0, 511, 512, 1023])
+def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_module, monkeypatch, rule_mask):
     options = SimpleNamespace(
         enable_graph_optimize=True,
         target_arch="Ascend910B1",
         compile_mode="simt_only",
+        graph_optimize_rule_mask=rule_mask,
         debug=False,
     )
 
     events, graph_calls = _run_make_ttir_with_recorded_graph_options(compiler_module, monkeypatch, options)
 
     assert graph_calls == [{
+        "rule_mask": rule_mask,
         "ub_capacity_bytes": 96 * 1024,
         "compile_mode": "simt_only",
     }]
     assert events[-1] == "run_row"
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
-def test_npu_options_do_not_expose_graph_remark_switch(compiler_module):
-    """Graph rewrite logging is controlled by LLVM DEBUG, not an NPU option."""
-    assert "graph_optimize_emit_remarks" not in compiler_module.NPUOptions.__dataclass_fields__
+@pytest.mark.parametrize("option", [
+    "graph_optimize_emit_remarks", "graph_optimize_max_rewrites_per_function", "graph_optimize_ub_capacity_bytes",
+    "allow_fp8e4nv", "auto_tile_and_bind_subblock"
+])
+def test_npu_options_do_not_expose_deprecated_graph_switches(compiler_module, option):
+    """Keep deprecated options out of the live, hashable dataclass contract."""
+    assert option not in compiler_module.NPUOptions.__dataclass_fields__
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")

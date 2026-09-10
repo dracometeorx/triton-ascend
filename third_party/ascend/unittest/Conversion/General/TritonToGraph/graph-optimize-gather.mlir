@@ -1,16 +1,26 @@
-// RUN: triton-opt --triton-to-structured -graph-optimize='rule-mask=512' %s | FileCheck %s
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --implicit-check-not=arith.shrsi
+// RUN: triton-opt %s --verify-each --triton-to-structured -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1' | FileCheck %s --check-prefix=DISABLED
+// DISABLED-NOT: tt.gather
 
 // A looped, tensor-built (tt.expand_dims/tt.broadcast) gather.
 
-// CHECK:   scf.if {{%[0-9]+}}
-// CHECK:   tt.load {{%[0-9]+}} {gather.optimised.load = "source"} : tensor<2x16x64x!tt.ptr<f32>>
+// CHECK: arith.select
+// CHECK: arith.minsi
+// CHECK: arith.maxsi
+// CHECK: %[[ZERO:.*]] = arith.constant 0 : i32
+// CHECK: arith.cmpi sge, {{.*}}, %[[ZERO]]
+// CHECK: scf.if
+// CHECK:   tt.load {{%[^,]+}}, {{%[^,]+}}, {{%[^ ]+}} {gather.optimised.load = "source"} : tensor<2x16x64x!tt.ptr<f32>>
 // CHECK:   tt.gather {{%[0-9]+}}[{{%[0-9]+}}] {axis = 2 : i32} : (tensor<2x16x64xf32>, tensor<2x16x128xi32>) -> tensor<2x16x128xf32>
+// CHECK:   arith.select
+// CHECK:   scf.yield
 // CHECK:   else
 // CHECK:   tt.load {{%[0-9]+, %[0-9]+, %cst_[0-9]+}} {gather.optimised.load = "fallback"} : tensor<2x16x128x!tt.ptr<f32>>
 
 module attributes {hacc.target = #hacc.target<"Ascend910B3">} {
   tt.func public @scalar_loop_load_nd(%src_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %idx_ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %out_ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32})  attributes {noinline = false} {
-    %cst = arith.constant dense<0.000000e+00> : tensor<2x16x128xf32>
+    %cst = arith.constant dense<-7.000000e+00> : tensor<2x16x128xf32>
     %c2_i32 = arith.constant 2 : i32
     %c0_i32 = arith.constant 0 : i32
     %cst_0 = arith.constant dense<0> : tensor<2x16x128xi32>

@@ -31,11 +31,13 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
@@ -64,14 +66,16 @@ using AxisInfo = PtrOffsetInfo::AxisInfo;
 // isSplatOfBlockArgPointer instead.
 class ReadOnlyOffsetClassifier {
 public:
-  const PtrOffsetInfo &classify(Value value) {
+  PtrOffsetInfo classify(Value value) {
     auto it = cache.find(value);
     if (it != cache.end())
       return it->second;
-    // Seed a placeholder before recursing, in case value is loop-carried.
-    PtrOffsetInfo &slot = cache[value];
-    slot = classifyUncached(value);
-    return cache[value];
+    // Recursion can grow the DenseMap. Neither callers nor this function may
+    // retain references into its buckets across another classify() call.
+    cache.try_emplace(value, unstructuredLike(value));
+    PtrOffsetInfo result = classifyUncached(value);
+    cache[value] = result;
+    return result;
   }
 
 private:
@@ -173,6 +177,14 @@ private:
 
   // Mirrors OffsetAnalysis::parseConstantOp.
   static PtrOffsetInfo classifyConstant(Value value) {
+    if (isa<RankedTensorType>(value.getType())) {
+      auto constant = value.getDefiningOp<arith::ConstantOp>();
+      auto elements = constant
+                          ? dyn_cast<DenseElementsAttr>(constant.getValue())
+                          : DenseElementsAttr();
+      if (!elements || !elements.isSplat())
+        return unstructuredLike(value);
+    }
     PtrOffsetInfo info;
     info.setScalarLike(true);
     if (auto tensorType = dyn_cast<RankedTensorType>(value.getType())) {
@@ -255,7 +267,7 @@ private:
     if (auto blockArg = dyn_cast<BlockArgument>(value)) {
       Operation *parentOp = blockArg.getOwner()->getParentOp();
       if (parentOp && isa<FunctionOpInterface>(parentOp))
-        return PtrOffsetInfo(); // matches parse()'s non-pointer argument case
+        return unstructuredLike(value);
       if (auto loopOp = dyn_cast_or_null<LoopLikeOpInterface>(parentOp)) {
         if (OpOperand *initArgOperand = loopOp.getTiedLoopInit(blockArg))
           return classify(initArgOperand->get());
@@ -281,14 +293,17 @@ struct GatherCandidate {
   triton::AddPtrOp addPtrOp;
   Value indices;
   Value srcPtr;
-  Value rowOffset; // may be null
+  Value
+      sourceBase; // Original element offsets, invariant along the gather axis.
+  // A scalar or a tensor broadcast across the gather axis; null if unmasked.
+  Value sourceMask;
   int indexRank = 0;
   int gatherAxis = 0;
   SmallVector<int64_t> srcShape;
 };
 
 bool isSplatOfBlockArgPointer(Operation *op) {
-  auto splatOp = dyn_cast<triton::SplatOp>(op);
+  auto splatOp = dyn_cast_or_null<triton::SplatOp>(op);
   if (!splatOp)
     return false;
   Value src = splatOp.getSrc();
@@ -303,9 +318,29 @@ bool isIntegerTensorType(Type type, int &rankOut) {
   return true;
 }
 
-// tt.gather only supports these element types for the gathered value.
+// Value types covered by this rule's current lowering and cost model.
 bool isSupportedGatherValueType(Type elementType) {
   return elementType.isF16() || elementType.isF32() || elementType.isBF16();
+}
+
+// Recover a scalar or tensor that broadcasts across the gather axis. Keep
+// the original SSA value so both pointer offsets and row masks retain their
+// exact computation instead of being reconstructed from a shape heuristic.
+Value findAxisInvariantValue(Value value, ArrayRef<int64_t> srcShape,
+                             int gatherAxis) {
+  while (auto broadcast = value.getDefiningOp<triton::BroadcastOp>())
+    value = broadcast.getSrc();
+  if (auto splat = value.getDefiningOp<triton::SplatOp>())
+    return splat.getSrc();
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  if (!type || type.getEncoding() || !type.hasStaticShape() ||
+      type.getRank() != static_cast<int64_t>(srcShape.size()) ||
+      type.getDimSize(gatherAxis) != 1)
+    return {};
+  for (size_t axis = 0; axis < srcShape.size(); ++axis)
+    if (type.getDimSize(axis) != 1 && type.getDimSize(axis) != srcShape[axis])
+      return {};
+  return value;
 }
 
 std::optional<uint64_t> getByteWidth(Type type) {
@@ -604,7 +639,6 @@ std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
 // graph-optimize-gather-scalar-row.mlir).
 struct ScalarAxisMatch {
   int64_t dimension;
-  Value carrier; // Also this rule's rowOffset (see call site).
 };
 
 std::optional<ScalarAxisMatch>
@@ -643,23 +677,25 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
   std::optional<int64_t> dim = extractMulIConstant(mulI);
   if (!dim)
     return std::nullopt;
-  Value carrier = mulI.getRhs().getDefiningOp<arith::ConstantOp>()
-                      ? mulI.getLhs()
-                      : mulI.getRhs();
-  return ScalarAxisMatch{*dim, carrier};
+  return ScalarAxisMatch{*dim};
 }
 
 // Matches a tt.load against the gather pattern and recovers its shape,
 // using ReadOnlyOffsetClassifier rather than the mutating OffsetAnalysis::parse.
 std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
                                                        unsigned ubCapacityBytes) {
+  // Volatile accesses cannot be replaced by a different set of reads.
+  if (loadOp.getIsVolatile() || !loadOp.getBoundaryCheck().empty())
+    return std::nullopt;
   auto addPtrOp = loadOp.getPtr().getDefiningOp<triton::AddPtrOp>();
-  if (!addPtrOp)
+  if (!addPtrOp || !isSplatOfBlockArgPointer(addPtrOp.getPtr().getDefiningOp()))
     return std::nullopt;
 
-  auto loadTensorType = dyn_cast<TensorType>(loadOp.getType());
-  auto ptrTensorType = dyn_cast<TensorType>(loadOp.getPtr().getType());
-  if (!loadTensorType || !ptrTensorType ||
+  auto loadTensorType = dyn_cast<RankedTensorType>(loadOp.getType());
+  auto ptrTensorType = dyn_cast<RankedTensorType>(loadOp.getPtr().getType());
+  if (!loadTensorType || !ptrTensorType || !loadTensorType.hasStaticShape() ||
+      loadTensorType.getEncoding() || ptrTensorType.getEncoding() ||
+      loadTensorType.getRank() < 2 || loadTensorType.getRank() > 5 ||
       loadTensorType.getShape() != ptrTensorType.getShape())
     return std::nullopt;
   if (!isSupportedGatherValueType(loadTensorType.getElementType()))
@@ -701,6 +737,12 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
   candidate.indices = indicesOp->getResult(0);
 
   if (!isIntegerTensorType(candidate.indices.getType(), candidate.indexRank))
+    return std::nullopt;
+  auto indicesType = cast<RankedTensorType>(candidate.indices.getType());
+  // The grid and the calibrated index-alignment model currently use i32.
+  if (!indicesType.getElementType().isInteger(32) ||
+      indicesType.getEncoding() ||
+      indicesType.getShape() != loadTensorType.getShape())
     return std::nullopt;
   if (candidate.indexRank > 5) {
     LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] rank " << candidate.indexRank
@@ -776,19 +818,14 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
     return std::nullopt;
   }
 
-  Operation *srcSplat =
-      findPrecedingOpWithCondition(analyzedOp, isSplatOfBlockArgPointer, stopIndices);
-  if (!srcSplat)
-    return std::nullopt;
-  candidate.srcPtr = cast<triton::SplatOp>(srcSplat).getSrc();
+  candidate.srcPtr =
+      addPtrOp.getPtr().getDefiningOp<triton::SplatOp>().getSrc();
 
   ArrayRef<int64_t> indexShape =
       cast<RankedTensorType>(candidate.indices.getType()).getShape();
 
-  // Axis 0 (the row dimension) comes from the indices' own shape, paired
-  // with rowOffset, recovered separately below.
+  // Axis 0 (the row dimension) comes from the indices' own shape.
   candidate.srcShape.push_back(indexShape[0]);
-  std::optional<Value> scalarRowCarrier;
   for (int axis = 1; axis < candidate.indexRank; axis++) {
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
@@ -796,7 +833,6 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
       if (std::optional<ScalarAxisMatch> scalarMatch =
               findScalarAxisDimension(srcAnalysisStart, indicesOp, classifier)) {
         dim = scalarMatch->dimension;
-        scalarRowCarrier = scalarMatch->carrier;
       }
     }
     if (!dim)
@@ -812,26 +848,42 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
 
   if (candidate.srcShape.size() != indexShape.size())
     return std::nullopt;
+  uint64_t sourceElements = 1, indexElements = 1;
   for (size_t d = 0; d < candidate.srcShape.size(); d++) {
+    if (candidate.srcShape[d] <= 0 || indexShape[d] <= 0 ||
+        !checkedMulU64(sourceElements, candidate.srcShape[d], sourceElements) ||
+        !checkedMulU64(indexElements, indexShape[d], indexElements) ||
+        sourceElements > std::numeric_limits<int32_t>::max() ||
+        indexElements > std::numeric_limits<int32_t>::max())
+      return std::nullopt;
     if (static_cast<int>(d) != candidate.gatherAxis &&
-        indexShape[d] > candidate.srcShape[d])
+        indexShape[d] != candidate.srcShape[d])
       return std::nullopt;
   }
 
-  if (scalarRowCarrier) {
-    // Axis 1's dimension came from findScalarAxisDimension: its carrier is
-    // rowOffset, tied to the same arith.muli rather than re-derived below.
-    candidate.rowOffset = *scalarRowCarrier;
-  } else if (Operation *rank0 = findPrecedingOpWithCondition(
-                 srcAnalysisStart,
-                 [&](Operation *op) {
-                   return classifier.classify(op->getResult(0)).getRank() ==
-                          0;
-                 },
-                 stopIndices)) {
-    // Nearest scalar (rank-0) value feeding srcAnalysisStart, normally
-    // "program_id * tile_size", the tile's row start.
-    candidate.rowOffset = rank0->getResult(0);
+  // Prove the exact last-axis address decomposition. Do not rebuild the row
+  // offsets: a range starting at a nonzero value or an extra constant bias
+  // must keep pointing to the same row after the rewrite.
+  auto offsetAdd = addPtrOp.getOffset().getDefiningOp<arith::AddIOp>();
+  if (!offsetAdd)
+    return std::nullopt;
+  Value base;
+  if (offsetAdd.getLhs() == candidate.indices)
+    base = offsetAdd.getRhs();
+  else if (offsetAdd.getRhs() == candidate.indices)
+    base = offsetAdd.getLhs();
+  else
+    return std::nullopt;
+  candidate.sourceBase =
+      findAxisInvariantValue(base, candidate.srcShape, candidate.gatherAxis);
+  if (!candidate.sourceBase)
+    return std::nullopt;
+
+  if (Value mask = loadOp.getMask()) {
+    candidate.sourceMask =
+        findAxisInvariantValue(mask, candidate.srcShape, candidate.gatherAxis);
+    if (!candidate.sourceMask)
+      return std::nullopt;
   }
 
   if (exceedsUbCapacity(candidate.srcShape, loadTensorType.getShape(),
@@ -868,11 +920,12 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
 // originally found, not just any gather pattern on its anchor load.
 bool candidatesMatch(const GatherCandidate &stored, const GatherCandidate &fresh) {
   return stored.loadOp == fresh.loadOp && stored.addPtrOp == fresh.addPtrOp &&
-        stored.indices == fresh.indices && stored.srcPtr == fresh.srcPtr &&
-        stored.rowOffset == fresh.rowOffset &&
-        stored.indexRank == fresh.indexRank &&
-        stored.gatherAxis == fresh.gatherAxis &&
-        stored.srcShape == fresh.srcShape;
+         stored.indices == fresh.indices && stored.srcPtr == fresh.srcPtr &&
+         stored.sourceBase == fresh.sourceBase &&
+         stored.sourceMask == fresh.sourceMask &&
+         stored.indexRank == fresh.indexRank &&
+         stored.gatherAxis == fresh.gatherAxis &&
+         stored.srcShape == fresh.srcShape;
 }
 
 template <typename TIOp>
@@ -970,12 +1023,10 @@ private:
     triton::LoadOp loadOp = candidate.loadOp;
     auto loadTensorType = cast<TensorType>(loadOp.getType());
     auto indicesTensorType = cast<TensorType>(candidate.indices.getType());
-    auto indicesShape = indicesTensorType.getShape();
     auto indexType = indicesTensorType.getElementType();
     auto loadElementType = loadTensorType.getElementType();
     ArrayRef<int64_t> srcShape = candidate.srcShape;
     int gatherAxis = candidate.gatherAxis;
-    Value rowOffset = candidate.rowOffset;
     Value srcPtr = candidate.srcPtr;
     Value ourIndices = candidate.indices;
 
@@ -987,6 +1038,24 @@ private:
 
     Location loc = loadOp.getLoc();
     rewriter.setInsertionPoint(loadOp);
+    Operation *previous = loadOp->getPrevNode();
+    auto rollback = llvm::make_scope_exit([&] {
+      while (Operation *created = loadOp->getPrevNode()) {
+        if (created == previous)
+          break;
+        rewriter.eraseOp(created);
+      }
+    });
+
+    if (loadOp.getMask()) {
+      // Inactive lanes must neither force fallback nor feed invalid indices
+      // to tt.gather. Their final value is restored from the original other.
+      auto zero = rewriter.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(cast<RankedTensorType>(indicesTensorType),
+                                      rewriter.getIntegerAttr(indexType, 0)));
+      ourIndices = rewriter.create<arith::SelectOp>(loc, loadOp.getMask(),
+                                                    ourIndices, zero);
+    }
 
     auto minIndex = reduce<arith::MinSIOp>(ourIndices, loc, rewriter);
     auto maxIndex = reduce<arith::MaxSIOp>(ourIndices, loc, rewriter);
@@ -994,7 +1063,7 @@ private:
       return failure();
 
     auto minAllowedIndex = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIntegerAttr(indexType, -srcShape[gatherAxis]));
+        loc, rewriter.getIntegerAttr(indexType, 0));
     auto minCond = rewriter.create<arith::CmpIOp>(
         loc, arith::CmpIPredicate::sge, minIndex, minAllowedIndex);
     auto maxAllowedIndex = rewriter.create<arith::ConstantOp>(
@@ -1008,103 +1077,65 @@ private:
                                            cond, /*hasElse=*/true);
     {
       OpBuilder thenBuilder = ifOp.getThenBodyBuilder(rewriter.getListener());
-      SmallVector<int64_t> gatherStrides(srcShape.size()),
-          gatherOffsets(srcShape.size()), gatherShape(srcShape.size());
-      Value grid = nullptr;
-      {
-        SmallVector<int64_t> srcStrides(srcShape.size());
-        int64_t s = 1;
-        for (int i = static_cast<int>(srcShape.size()) - 1; i >= 0; i--) {
-          srcStrides[i] = s;
-          s *= srcShape[i];
-        }
-        auto i32Type = thenBuilder.getI32Type();
-        auto gridTy = RankedTensorType::get(srcShape, i32Type);
-        for (size_t i = 0; i < srcShape.size(); i++) {
-          gatherOffsets[i] = 0;
-          gatherStrides[i] = 1;
-          gatherShape[i] =
-              (static_cast<int>(i) == gatherAxis) ? srcShape[i] : indicesShape[i];
-          // The range here builds the offset grid for loading the full
-          // srcShape-sized tile, not the (possibly smaller) gatherShape --
-          // that's sliced out of the loaded tile afterwards.
-          auto rangeTy = RankedTensorType::get({srcShape[i]}, i32Type);
-          Value range = thenBuilder.create<triton::MakeRangeOp>(
-              loc, rangeTy, 0, srcShape[i]);
-          Value expanded;
-          if (i == 0 && rowOffset) {
-            auto offset =
-                thenBuilder.create<triton::SplatOp>(loc, rangeTy, rowOffset);
-            expanded = thenBuilder.create<arith::AddIOp>(loc, range, offset);
-          } else {
-            expanded = range;
-          }
-          for (size_t d = 0; d < i; d++) {
-            SmallVector<int64_t> expandedShape(
-                cast<RankedTensorType>(expanded.getType()).getShape());
-            expandedShape.insert(expandedShape.begin(), 1);
-            auto expandedTy = RankedTensorType::get(expandedShape, i32Type);
-            expanded = thenBuilder.create<triton::ExpandDimsOp>(
-                loc, expandedTy, expanded, /*axis=*/0);
-          }
-          for (size_t d = i + 1; d < srcShape.size(); d++) {
-            auto curShape =
-                cast<RankedTensorType>(expanded.getType()).getShape();
-            SmallVector<int64_t> expandedShape(curShape.begin(), curShape.end());
-            expandedShape.push_back(1);
-            auto expandedTy = RankedTensorType::get(expandedShape, i32Type);
-            expanded = thenBuilder.create<triton::ExpandDimsOp>(
-                loc, expandedTy, expanded, /*axis=*/curShape.size());
-          }
-          Value bcast =
-              thenBuilder.create<triton::BroadcastOp>(loc, gridTy, expanded);
-          Value strideVal = thenBuilder.create<arith::ConstantIntOp>(
-              loc, i32Type, srcStrides[i]);
-          Value strideSplat =
-              thenBuilder.create<triton::SplatOp>(loc, gridTy, strideVal);
-          Value strideMulI =
-              thenBuilder.create<arith::MulIOp>(loc, bcast, strideSplat);
-          grid = grid ? thenBuilder.create<arith::AddIOp>(loc, grid, strideMulI)
-                      : strideMulI;
-        }
+      auto i32Type = thenBuilder.getI32Type();
+      auto gridType = RankedTensorType::get(srcShape, i32Type);
+      Value base;
+      if (candidate.sourceBase.getType().isInteger(32))
+        base = thenBuilder.create<triton::SplatOp>(loc, gridType,
+                                                   candidate.sourceBase);
+      else if (candidate.sourceBase.getType() == gridType)
+        base = candidate.sourceBase;
+      else
+        base = thenBuilder.create<triton::BroadcastOp>(loc, gridType,
+                                                       candidate.sourceBase);
+      auto rangeType = RankedTensorType::get({srcShape[gatherAxis]}, i32Type);
+      Value columns = thenBuilder.create<triton::MakeRangeOp>(
+          loc, rangeType, 0, srcShape[gatherAxis]);
+      for (int axis = 0; axis < gatherAxis; ++axis) {
+        SmallVector<int64_t> shape(
+            cast<RankedTensorType>(columns.getType()).getShape());
+        shape.insert(shape.begin(), 1);
+        columns = thenBuilder.create<triton::ExpandDimsOp>(
+            loc, RankedTensorType::get(shape, i32Type), columns, 0);
       }
-
-      // Normalize negative indices: idx += srcShape[axis] & (idx >> (bits-1)).
-      auto bitWidth = indexType.getIntOrFloatBitWidth();
-      auto cShift = thenBuilder.create<arith::ConstantOp>(
-          loc, thenBuilder.getIntegerAttr(indexType, bitWidth - 1));
-      auto cShiftTensor =
-          thenBuilder.create<triton::SplatOp>(loc, ourIndices.getType(), cShift);
-      auto shifted =
-          thenBuilder.create<arith::ShRSIOp>(loc, ourIndices, cShiftTensor);
-      auto srcColsTensor = thenBuilder.create<triton::SplatOp>(
-          loc, indicesTensorType, maxAllowedIndex);
-      auto mask = thenBuilder.create<arith::AndIOp>(loc, srcColsTensor, shifted);
-      auto indexNormalized =
-          thenBuilder.create<arith::AddIOp>(loc, ourIndices, mask);
+      columns = thenBuilder.create<triton::BroadcastOp>(loc, gridType, columns);
+      Value grid = thenBuilder.create<arith::AddIOp>(loc, base, columns);
 
       auto newSplat = thenBuilder.create<triton::SplatOp>(
           loc, RankedTensorType::get(srcShape, srcPtr.getType()), srcPtr);
       auto addPtr = thenBuilder.create<triton::AddPtrOp>(
           loc, newSplat.getType(), newSplat.getResult(), grid);
+      Value sourceMask, sourceOther;
+      if (candidate.sourceMask) {
+        auto maskType =
+            RankedTensorType::get(srcShape, thenBuilder.getI1Type());
+        if (candidate.sourceMask.getType().isInteger(1))
+          sourceMask = thenBuilder.create<triton::SplatOp>(
+              loc, maskType, candidate.sourceMask);
+        else if (candidate.sourceMask.getType() == maskType)
+          sourceMask = candidate.sourceMask;
+        else
+          sourceMask = thenBuilder.create<triton::BroadcastOp>(
+              loc, maskType, candidate.sourceMask);
+        auto sourceType = RankedTensorType::get(srcShape, loadElementType);
+        sourceOther = thenBuilder.create<arith::ConstantOp>(
+            loc, DenseElementsAttr::get(
+                     sourceType, thenBuilder.getZeroAttr(loadElementType)));
+      }
       auto load = thenBuilder.create<triton::LoadOp>(
-          loc, addPtr, Value(), Value(), loadOp.getCache(), loadOp.getEvict(),
-          loadOp.getIsVolatile());
+          loc, addPtr, sourceMask, sourceOther, loadOp.getCache(),
+          loadOp.getEvict(), loadOp.getIsVolatile());
       load->setAttr(kGatherOptimisedLoadAttr,
                     StringAttr::get(load->getContext(), "source"));
       Value input = load.getResult();
 
-      if (gatherShape != ArrayRef<int64_t>(srcShape)) {
-        auto resultTy = RankedTensorType::get(gatherShape, loadElementType);
-        input = thenBuilder.create<tensor::ExtractSliceOp>(
-            loc, resultTy, load, ValueRange{}, ValueRange{}, ValueRange{},
-            gatherOffsets, gatherShape, gatherStrides);
-      }
-
       auto gather = thenBuilder.create<triton::GatherOp>(
-          loc, loadTensorType, input, indexNormalized,
-          candidate.indexRank - 1);
-      thenBuilder.create<scf::YieldOp>(loc, gather->getResult(0));
+          loc, loadTensorType, input, ourIndices, candidate.indexRank - 1);
+      Value result = gather.getResult();
+      if (loadOp.getMask() && loadOp.getOther())
+        result = thenBuilder.create<arith::SelectOp>(loc, loadOp.getMask(),
+                                                     result, loadOp.getOther());
+      thenBuilder.create<scf::YieldOp>(loc, result);
     }
     {
       OpBuilder elseBuilder = ifOp.getElseBodyBuilder(rewriter.getListener());
@@ -1115,6 +1146,13 @@ private:
       elseBuilder.create<scf::YieldOp>(loc, clonedLoad->getResult(0));
     }
 
+    Operation *first =
+        previous ? previous->getNextNode() : &loadOp->getBlock()->front();
+    for (Operation *created = first; created != loadOp.getOperation();
+         created = created->getNextNode())
+      if (failed(mlir::verify(created)))
+        return failure();
+    rollback.release();
     rewriter.replaceOp(loadOp, ifOp.getResult(0));
     return success();
   }

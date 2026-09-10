@@ -25,6 +25,8 @@
 #include "TritonToGraph/Passes.h"
 #include "Utils/Utils.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/DenseMap.h"
@@ -142,7 +144,8 @@ public:
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<tensor::TensorDialect>();
+    registry
+        .insert<arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() override;
