@@ -43,6 +43,12 @@ def parse_args():
         parser.error("rows must be divisible by row-block, and row-block by row-step")
     if args.rows < 2:
         parser.error("rows must be at least 2")
+    # The kernel combines base + index as i32 before adding it to src_ptr.
+    # Include the upper_bound case's last legal pointer and index/output grids.
+    if any((args.rows + 1) * width > 2**31 - 1 for width in args.widths):
+        parser.error("source element offsets must fit in signed i32")
+    if any(args.rows * k - 1 > 2**31 - 1 for k in args.index_widths):
+        parser.error("index/output element offsets must fit in signed i32")
     return args
 
 
@@ -66,6 +72,8 @@ def main():
     import triton
     from triton.backends.ascend.testing import do_bench_npu
     from triton.backends.ascend.utils import _get_npucompiler_path
+    import triton.backends.ascend.compiler as ascend_compiler
+    import triton._C.libtriton as native
     from test_gather_graph_optimize import indirect_rows_kernel
 
     if not torch.npu.is_available():
@@ -80,6 +88,9 @@ def main():
         "torch": torch.__version__,
         "torch_npu": getattr(torch_npu, "__version__", "unknown"),
         "triton": triton.__file__,
+        "ascend_backend": ascend_compiler.__file__,
+        "native": native.__file__,
+        "kernel_source": indirect_rows_kernel.fn.__code__.co_filename,
         "compiler": _get_npucompiler_path()[0],
         "environment": {
             key: os.getenv(key)
@@ -153,7 +164,11 @@ def main():
                 rewritten[mask] = "tt.gather" in ttir
                 assert not (mask == 511 and rewritten[mask]), "Gather appeared with the rule disabled"
                 if mask == 1023 and args.require_rewrite:
-                    assert rewritten[mask], f"Gather did not fire at {point}"
+                    if not rewritten[mask]:
+                        raise RuntimeError(
+                            f"Gather did not fire at {point} (ROW_BLK={args.row_block}, ROW_STEP={args.row_step}). "
+                            f"Inspect {point_dir / 'mask1023.ttir'} and {root / 'run.json'}; "
+                            "no performance comparison has been recorded for this point.")
                 torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
             timings = {511: [], 1023: []}
             for round_index in range(args.rounds):

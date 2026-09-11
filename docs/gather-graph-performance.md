@@ -9,6 +9,11 @@
 采集设备上的 kernel 耗时。两份编译仅改变规则掩码：511 关闭 gather；1023 启用
 gather。其他规则、输入、grid 和 tiling 一致；索引为 i32。
 
+共享 kernel 显式计算 `offsets = base + indices` 后再做 `src_ptr + offsets`，
+以符合 v3 规则的直接指针匹配要求。旧写法 `src_ptr + base + indices` 会生成嵌套
+指针加法；动态 i32 偏移因溢出语义不同，前序 pass 不保证将其合并，可能导致规则
+不命中。更新性能入口时也必须同步 `test_gather_graph_optimize.py`。
+
 ## 运行
 
 在已构建并安装当前代码的服务器环境中，从仓库根目录执行。需要 torch、torch_npu、
@@ -76,7 +81,7 @@ rows 必须能被 row-block 整除，row-block 必须能被 row-step 整除；�
 
 | 文件 | 内容 |
 | --- | --- |
-| `run.json` | 提交、工作区状态、设备、版本、编译器路径、关键环境变量和参数 |
+| `run.json` | 提交、工作区状态、设备、版本、Python 后端/原生扩展/kernel 源码路径、编译器路径、关键环境变量和参数 |
 | `summary.csv` | 每个点的 off/on 微秒耗时、加速比、各轮均值的最小/最大值、改写命中 |
 | `samples.csv` | 每轮每个版本的耗时与 kernel 名称，逐条落盘 |
 | `<point>/mask511.ttir`、`mask1023.ttir` | 编译后 TTIR，用于核对是否触发 gather |

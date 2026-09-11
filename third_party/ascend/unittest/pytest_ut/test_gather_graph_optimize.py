@@ -35,18 +35,24 @@ def indirect_rows_kernel(src_ptr, idx_ptr, out_ptr, n_rows, WIDTH: tl.constexpr,
         # Leave one physical row before the logical source so negative pointer
         # offsets are valid and have a different answer from wrapped indices.
         base = (rows + 1)[:, None] * WIDTH
-        value = tl.load(src_ptr + base + indices, mask, other=-7.0, volatile=VOLATILE)
+        # Keep the integer offset addition before the pointer addition. Nested
+        # addptr operations with dynamic i32 offsets cannot generally be folded
+        # together (the combined i32 sum could overflow), and are outside the
+        # gather rule's direct-pointer matcher. Test addresses fit in i32.
+        offsets = base + indices
+        value = tl.load(src_ptr + offsets, mask, other=-7.0, volatile=VOLATILE)
         # Output includes padding rows: observe `other` rather than hiding it
         # behind a masked store. The host allocates ROW_BLK rows per program.
         tl.store(out_ptr + positions, value)
 
 
-def make_indirect_ttir(rule_mask, *, per_lane=False, volatile=False, index_type="i32", value_type="fp32"):
+def make_indirect_ttir(rule_mask, *, per_lane=False, volatile=False, index_type="i32", value_type="fp32", row_blk=8,
+                       row_step=2):
     options = NPUOptions(arch="Ascend910B1", graph_optimize_rule_mask=rule_mask)
     source = ASTSource(
         indirect_rows_kernel,
         {"src_ptr": f"*{value_type}", "idx_ptr": f"*{index_type}", "out_ptr": f"*{value_type}", "n_rows": "i32"},
-        {"WIDTH": 16, "K": 8, "ROW_BLK": 8, "ROW_STEP": 2, "PER_LANE": per_lane, "VOLATILE": volatile},
+        {"WIDTH": 16, "K": 8, "ROW_BLK": row_blk, "ROW_STEP": row_step, "PER_LANE": per_lane, "VOLATILE": volatile},
     )
     context = ir.context()
     ir.load_dialects(context)
@@ -90,6 +96,15 @@ def test_gather_rule_in_make_ttir(tmp_path, rule_mask, per_lane, volatile, index
 
 def test_gather_rule_mask_changes_cache_key():
     assert NPUOptions(graph_optimize_rule_mask=511).hash() != NPUOptions(graph_optimize_rule_mask=1023).hash()
+
+
+@pytest.mark.parametrize("rule_mask", [511, 512, 1023])
+@pytest.mark.parametrize("value_type", ["fp32", "fp16", "bf16"])
+def test_gather_rule_benchmark_tiling(rule_mask, value_type):
+    # Cover the performance runner's default tile, in addition to the smaller
+    # 8/2 tile used by the numerical safety tests.
+    module = make_indirect_ttir(rule_mask, value_type=value_type, row_blk=128, row_step=4)
+    assert ("tt.gather" in str(module)) == bool(rule_mask & 512)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
