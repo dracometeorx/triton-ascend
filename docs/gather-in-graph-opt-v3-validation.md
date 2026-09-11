@@ -98,6 +98,117 @@ the tail case are not padded to the complete launch tile. Run these cases with
 the server's supported device-memory sanitizer as well: numerical equality alone
 does not prove that no inactive source lane was read.
 
+`TRITON_ENABLE_SANITIZER=1` enables compiler instrumentation; it does not launch
+the device checker. Run instrumented kernels through `mssanitizer`, and disable
+the PyTorch NPU memory pool so allocation boundaries remain visible to the
+checker. Upgrading bishengir alone does not configure the checker runtime. Follow
+the installed tool's hardware/toolchain requirements and environment setup.
+See the official [Triton checking example](https://github.com/Ascend/mssanitizer/blob/master/docs/zh/best_practices/mssanitizer_basic_cases.md#4-检测triton算子)
+and [AscendNPU-IR debugging guide](https://github.com/Ascend/AscendNPU-IR/blob/master/docs/source/en/user_guide/debug_option.md).
+
+Start with one case in a single process, retaining both pytest and checker output:
+
+```bash
+GATHER_TEST=third_party/ascend/unittest/pytest_ut/test_gather_graph_optimize.py
+mkdir -p gather-v3-test-results
+command -v mssanitizer
+set -o pipefail
+TRITON_ENABLE_SANITIZER=1 \
+TRITON_ALWAYS_COMPILE=1 \
+PYTORCH_NO_NPU_MEMORY_CACHING=1 \
+ASCEND_LAUNCH_BLOCKING=1 \
+mssanitizer --tool=memcheck -- python -m pytest -vv -s -x --tb=long \
+  "$GATHER_TEST" -k 'npu_equivalence and tail and float32' \
+  --junitxml=gather-v3-test-results/npu-sanitizer-smoke.xml \
+  2>&1 | tee gather-v3-test-results/npu-sanitizer-smoke.log
+```
+
+After it passes without checker findings, repeat with `-k npu_equivalence` and
+different log/XML filenames to cover all 21 cases. Keep the checker's own report
+files as well; a passing pytest result alone does not establish a clean memory
+check. Do not add pytest workers for this focused run.
+
+For runtime diagnosis, the command also enables synchronous PyTorch execution
+with `ASCEND_LAUNCH_BLOCKING=1`; see the official
+[environment variable reference](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/apiref/envvar/envref_07_0050.html).
+Keep this diagnostic setting out of performance measurements. The test already
+explicitly synchronizes after each Triton launch.
+
+An `ACL stream synchronize failed, error code:507035` with `vector core exception`
+is a runtime failure, not by itself a sanitizer memory finding. When later cases
+fail at `source.npu()` before their kernel launches, an earlier device exception
+in the same process may be causing those failures. Exit that test process and
+rerun with `-x` in a fresh process to retain the first failure. Stage markers from
+`pytest -s` distinguish input copying, compile/launch, synchronization, and
+successful verification for each rule mask. A new process is a diagnostic step,
+not a guarantee of recovering a device that remains unhealthy.
+
+If a compiler upgrade appears ineffective, inspect the executable selected by
+the backend, which prefers its bundled bishengir over the shell's PATH:
+
+```bash
+python - <<'PY'
+import subprocess
+from triton.backends.ascend.utils import _get_npucompiler_path
+
+compiler, compiler_env = _get_npucompiler_path()
+print("Selected compiler:", compiler, flush=True)
+subprocess.run([compiler, "--version"], env=compiler_env, check=True)
+PY
+```
+
+On failure, retain the first compiler/runtime error and the rule mask from the
+pytest traceback. Each case executes mask 511 before mask 1023; a failure at 511
+already occurs with gather disabled and cannot by itself establish a gather
+rewrite bug. Unknown compiler options, missing libraries, or checker startup
+errors need toolchain/runtime diagnosis. An `illegal read`/`illegal write` report
+needs address and generated-code analysis even when numerical tests pass. Do not
+assume either category from the bishengir version alone.
+
+For a hard abort inside the first launch, use the standalone probe to select one
+kernel and one rule mask per process. It reuses the regression's indirect kernel,
+compiles with JIT warmup, saves the available IR/binary artifacts before launch,
+and verifies the selected rule's TTIR activation and numerical output. It does
+not replace the paired 21-case correctness suite.
+
+```bash
+GATHER_PROBE=third_party/ascend/unittest/pytest_ut/gather_sanitizer_probe.py
+set -o pipefail
+gather_probe() {
+  local probe_case="$1"
+  local probe_mask="$2"
+  local probe_dir="gather-v3-test-results/probe-${probe_case}-${probe_mask}"
+  mkdir -p "$probe_dir"
+  TRITON_ENABLE_SANITIZER=1 \
+  TRITON_ALWAYS_COMPILE=1 \
+  PYTORCH_NO_NPU_MEMORY_CACHING=1 \
+  ASCEND_LAUNCH_BLOCKING=1 \
+  mssanitizer --tool=memcheck -- python "$GATHER_PROBE" \
+    --case "$probe_case" --rule-mask "$probe_mask" --output-dir "$probe_dir" \
+    2>&1 | tee "$probe_dir/console.log"
+}
+gather_probe copy 0
+```
+
+Run `gather_probe tail 511` only after the simple contiguous copy passes without
+checker findings, then `gather_probe tail 1023` after the disabled-gather tail
+passes. If the tail fails with 511, compare `gather_probe full 511` (eight valid
+rows, no masked tail) and `gather_probe tail 0` (all graph rules disabled), each in
+a fresh invocation. Stop the failing process before the next diagnostic. A
+failure with gather disabled is not evidence against the gather rewrite; if only
+1023 fails, focus on the rewrite and its interaction with instrumentation.
+
+The reported September 11 failure started msSanitizer from the CANN 9.0.0 tools
+directory, registered one `indirect_rows_kernel`, and then aborted with an MPU
+invalid-address exception at PC offset `0x56dc` from the reported kernel start.
+The `No error detected` checker line cannot be treated as a pass when the device
+subsequently faults and the process exits by signal 6. The supplied tool log has
+host allocation/copy records and kernel-finish records, but no detailed kernel
+memory-access report; it does not locate the offending source operation. Preserve
+the matching binary and full tool/driver logs to map the device PC. The original
+paired test runs 511 first, so the single-launch log points toward that baseline,
+but the probe's explicit rule-mask output and TTIR are needed to confirm it.
+
 After the focused cases pass, run the existing graph/layout regression suites:
 
 ```bash

@@ -117,11 +117,17 @@ def test_gather_rule_npu_equivalence(monkeypatch, dtype, case):
         reference[row] = source[(row + 1) * width + indices[row].long()]
     if case == "per_lane":
         reference[:, 1::2] = -7.0
+    # Keep stage markers visible with pytest -s: after a device exception,
+    # subsequent cases may fail during input copies before launching a kernel.
+    diagnostic = f"[gather] case={case} dtype={dtype}"
+    print(f"{diagnostic} stage=copy-inputs", flush=True)
     source_npu, indices_npu = source.npu(), indices.npu()
+    print(f"{diagnostic} stage=inputs-ready", flush=True)
     outputs = []
     for rule_mask in (511, 1023):
         indirect_rows_kernel.device_caches.clear()
         output = torch.empty((row_blk, k), dtype=getattr(torch, dtype), device="npu")
+        print(f"{diagnostic} rule_mask={rule_mask} stage=compile-and-launch", flush=True)
         compiled = indirect_rows_kernel[(1, )](
             source_npu,
             indices_npu,
@@ -135,9 +141,11 @@ def test_gather_rule_npu_equivalence(monkeypatch, dtype, case):
             VOLATILE=case == "volatile",
             graph_optimize_rule_mask=rule_mask,
         )
+        print(f"{diagnostic} rule_mask={rule_mask} stage=synchronize", flush=True)
         torch.npu.synchronize()
         expected_rewrite = rule_mask == 1023 and case not in ("per_lane", "volatile", "i64")
         assert ("tt.gather" in compiled.asm["ttir"]) == expected_rewrite
         outputs.append(output.cpu())
         torch.testing.assert_close(outputs[-1], reference, rtol=0, atol=0)
+        print(f"{diagnostic} rule_mask={rule_mask} stage=verified", flush=True)
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
