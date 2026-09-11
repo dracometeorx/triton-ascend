@@ -1,5 +1,100 @@
 # Gather GraphOptimize 性能测试
 
+## 主性能回归：PR #1027 原始负载
+
+主入口是 `third_party/ascend/unittest/pytest_ut/bench_gather_pr1027.py`，kernel 位于
+同目录的 `gather_pr1027_kernel.py`。来源是
+[PR #1027 的原始附件](https://github.com/user-attachments/files/30009694/test_gather_optimization.py)。
+
+此入口保留原附件的全部 14 组 shape、ND kernel、FP32 数据/i32 索引、最后一维 gather、
+`CORES=40` 和 `UB_SIZE=192*1024`，以及原有 ROW_STEP 的向上取整公式。没有改成
+二维 flatten、补齐宽度或重新选择 tiling。包括 `K=3076`、`ROW_STEP=3` 和不能整除
+的 `ROW_BLK=1639`。kernel 的地址表达式、load/store mask、other=0、N_ROWS 等
+constexpr 参数也保持原样。主机测试通过 AST 摘要检查 shape 和 kernel 与附件一致。
+
+外围驱动加入规则掩码 511/1023 对照：两版本使用同一份源、索引和输出缓冲区，只有
+规则掩码不同。每个版本计时前单独与 torch.gather 参考比较（零容差），并先将输出
+置为 NaN，避免漏写被上一版本的结果掩盖。参考计算需要的 i64 转换仅用于
+torch.gather，实际被测 kernel 仍接收原来的 i32 索引。torch.gather 不参与计时。
+
+在已安装当前代码的服务器环境中，从仓库根目录执行：
+
+```bash
+unset ASCEND_LAUNCH_BLOCKING PYTORCH_NO_NPU_MEMORY_CACHING
+unset TRITON_ALWAYS_COMPILE TRITON_ENABLE_SANITIZER
+BENCH=third_party/ascend/unittest/pytest_ut/bench_gather_pr1027.py
+
+# 无需 NPU：列出原始形状及 tiling；ID 为 1～14。
+python "$BENCH" --list-cases
+
+# 原始第 1 组，shape 和 tiling 不缩小，只减少采样确认流程。
+python "$BENCH" --device 0 --case-ids 1 \
+  --rounds 1 --warmup 3 --repeat 10 \
+  --output-dir gather-v3-perf/pr1027-smoke
+
+# 正式主回归：全部 14 组，所有版本使用同一种 profiler 计时。
+python "$BENCH" --device 0 --rounds 3 --warmup 5 --repeat 30 \
+  --output-dir gather-v3-perf/pr1027-full
+```
+
+脚本直接使用仓库的 `do_bench_npu`，无需设置 TRITON_BENCH_METHOD。默认不主动清
+L2；若要比较清缓存条件，单独运行并添加 `--clear-l2-cache`，使用不同输出目录。
+warmup/repeat 是每轮调用次数；汇总耗时为各轮平均设备 kernel 耗时的中位数，统一
+转换为微秒。采样顺序在 511/1023 间交替。编译、初始化、精度检查均在计时之外。
+每个输出目录使用新编译缓存并关闭 sanitizer，目录必须不存在。
+
+每次只保留一个配置的张量，完成后释放其引用。原始规模较大，单组源、索引和输出
+合计约 384～2304 MiB，正确性参考和临时张量还会额外占用内存。脚本保留这些规模。
+
+| ID | 源 shape | 索引/输出 shape | ROW_STEP | 每 program 循环次数 |
+| --- | --- | --- | --- | --- |
+| 1 | (65536,4096) | (65536,2048) | 2 | 820 |
+| 2 | (65536,2048) | (65536,3076) | 2 | 820 |
+| 3 | (65536,1024) | (65536,4096) | 1 | 1639 |
+| 4 | (65536,64,64) | (65536,64,32) | 2 | 820 |
+| 5 | (65536,64,32) | (65536,64,32) | 2 | 820 |
+| 6 | (65536,16,64) | (65536,16,128) | 2 | 820 |
+| 7 | (65536,16,16,16) | (65536,16,16,8) | 2 | 820 |
+| 8 | (65536,16,8,16) | (65536,16,8,16) | 2 | 820 |
+| 9 | (65536,4,8,32) | (65536,4,8,64) | 2 | 820 |
+| 10 | (65536,4,8,8,8) | (65536,4,8,8,4) | 3 | 547 |
+| 11 | (65536,4,4,2,16) | (65536,4,4,2,16) | 8 | 205 |
+| 12 | (65536,8,2,2,8) | (65536,8,2,2,32) | 4 | 410 |
+| 13 | (65536,2,2,1,64) | (65536,2,2,1,256) | 4 | 410 |
+| 14 | (65536,32,2,2,2) | (65536,32,2,2,8) | 4 | 410 |
+
+所有配置 grid=(40,)，ROW_BLK=1639。若某个工具链不能编译其中的非 2 幂配置，记录
+真实编译错误，使用 `--case-ids` 单独排查；不要修改 shape/ROW_STEP 后仍视为原始回归。
+
+主回归输出：
+
+- `run.json`：全部选中配置、版本、设备、编译器、源码位置、提交和环境变量。
+- `summary.csv`：每组 shape/tiling、`status`、`rewritten`、off/on 微秒耗时及各轮范围。
+  `time_ratio=off_us/on_us` 始终记录；只有实际命中时才填写 `speedup`。
+- `samples.csv`：各轮原始平均耗时，逐条写入。
+- `case_XX/case.json`、`compile.json`：该组参数、命中状态及实际 kernel 名称。
+- `case_XX/mask511.ttir`、`mask1023.ttir`：两份编译结果。
+- `case_XX/profile_r*_mask*/`：原始 profiler 报告；按实际 kernel 名称过滤并检查采样数。
+
+关闭规则却出现 tt.gather 会立即报错。开启后未命中时记录 `not_rewritten`，保留该组
+原始参数和耗时，`speedup` 留空，继续运行其他配置。当前收益/UB 门槛可能拒绝原附件
+中的部分配置，不能通过改 shape 掩盖。需要严格验收全部命中时加 `--require-rewrite`，
+它在完成所选配置后因任何未命中返回非零退出码。
+
+编译、精度或 profiler 错误会写入该组 `error.txt` 和汇总的 `error` 状态，然后停止；
+已完成的结果保留。避免设备异常后继续执行产生连锁错误。用新目录和 `--case-ids`
+可以单独重跑某组。
+
+主机回归入口（无需 NPU 执行）：
+
+```bash
+python -m pytest -q third_party/ascend/unittest/pytest_ut/test_bench_gather_pr1027.py
+```
+
+## 二维诊断微基准
+
+`bench_gather_graph_optimize.py` 保留为补充诊断，下面的配置不代替上述原始 ND 主回归。
+
 现有 `test_gather_graph_optimize.py` 是正确性回归，不能用 pytest 总耗时评估性能。
 `test_gather_simd.py` 和 `tutorials/10-gather-2d-simd.py` 已经显式使用
 `tl.gather`，不能直接测量间接 load 自动改写的收益。
