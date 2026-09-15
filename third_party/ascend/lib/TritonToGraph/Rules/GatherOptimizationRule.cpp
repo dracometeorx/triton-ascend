@@ -385,7 +385,8 @@ bool hasFullRowReadWitness(const GatherCandidate &candidate) {
         load.getResult().use_empty() || !load.getBoundaryCheck().empty())
       continue;
     auto type = dyn_cast<RankedTensorType>(load.getType());
-    if (!type || type.getEncoding() || type.getShape() != candidate.srcShape ||
+    if (!type || type.getEncoding() ||
+        type.getShape() != ArrayRef<int64_t>(candidate.srcShape) ||
         type.getElementType() != elementType)
       continue;
     auto addPtr = load.getPtr().getDefiningOp<triton::AddPtrOp>();
