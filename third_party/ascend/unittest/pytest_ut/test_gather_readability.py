@@ -24,7 +24,9 @@ def run_gather_pass(tmp_path, text, **options):
     path = tmp_path / "gather-input.mlir"
     path.write_text("module {\n" + text + "\n}")
     module = ir.parse_mlir_module(str(path), context)
-    pm = ir.pass_manager(module.context)
+    # Parsed modules do not carry the Python context attribute attached by
+    # ast_to_ttir. Keep using the context that owns this parsed module.
+    pm = ir.pass_manager(context)
     options.setdefault("target_arch", "Ascend910B1")
     ascend.passes.ttir.add_graph_optimize(pm, rule_mask=512, ub_capacity_bytes=96 * 1024, compile_mode="simd",
                                           **options)
