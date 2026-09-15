@@ -141,6 +141,7 @@ public:
     this->maxRewritesPerFunction = options.maxRewritesPerFunction;
     this->ubCapacityBytes = options.ubCapacityBytes;
     this->compileMode = options.compileMode;
+    this->targetArch = options.targetArch;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -192,6 +193,7 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
   options.maxRewritesPerFunction = static_cast<unsigned>(cliMaxRewrites);
   options.ubCapacityBytes = static_cast<unsigned>(cliUBCapacityBytes);
   options.compileMode = this->compileMode;
+  options.targetArch = this->targetArch;
   return success();
 }
 
@@ -213,11 +215,11 @@ void GraphOptimizePass::runOnOperation() {
 
   LLVM_DEBUG({
     llvm::dbgs() << "[graph-optimize] rule-mask="
-                << static_cast<unsigned>(options.enabledRuleMask)
-                << " max-rewrites-per-function="
-                << options.maxRewritesPerFunction
-                << " compile-mode=" << options.compileMode
-                << " enabled rules:";
+                 << static_cast<unsigned>(options.enabledRuleMask)
+                 << " max-rewrites-per-function="
+                 << options.maxRewritesPerFunction
+                 << " compile-mode=" << options.compileMode
+                 << " target-arch=" << options.targetArch << " enabled rules:";
     for (GraphOptimizationRule *rule : enabledRules)
       llvm::dbgs() << " " << ruleIdToString(rule->getId());
     llvm::dbgs() << "\n";
@@ -516,10 +518,17 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::StoreCoalescing)) {
     rules.push_back(createStoreCoalescingRule(options.ubCapacityBytes));
   }
-  // The full-row preload and gather cost model is supported only for explicit
-  // SIMD. Template mode can lower indirect accesses through SIMT on A5.
+  // A5 lowers tt.gather through SIMT even with the explicit SIMD selector.
+  // Keep this rule on known non-A5 targets until its lowering and cost model
+  // are validated there. Missing/future target names conservatively decline.
+  llvm::StringRef target = options.targetArch;
+  bool gatherTarget =
+      target.starts_with("Ascend910A") || target.starts_with("Ascend910B") ||
+      target.starts_with("Ascend910D") || target.starts_with("Ascend910_93") ||
+      target.starts_with("Ascend310B");
   if (triton::ascend::parseCompileMode(options.compileMode) ==
           triton::ascend::CompileMode::Simd &&
+      gatherTarget &&
       isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::GatherOptimization)) {
     rules.push_back(createGatherOptimizationRule(options.ubCapacityBytes));

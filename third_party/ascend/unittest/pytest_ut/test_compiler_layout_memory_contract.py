@@ -563,8 +563,22 @@ def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_modu
         "rule_mask": rule_mask,
         "ub_capacity_bytes": 96 * 1024,
         "compile_mode": "simt_only",
+        "target_arch": "Ascend910B1",
     }]
     assert events[-1] == "run_row"
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B1", "Ascend910_9391", "Ascend910_9589", "Ascend950", "unknown"])
+def test_make_ttir_forwards_gather_target(compiler_module, monkeypatch, arch):
+    options = SimpleNamespace(enable_graph_optimize=True, target_arch=arch, compile_mode="simd",
+                              graph_optimize_rule_mask=512, debug=False)
+    _, graph_calls = _run_make_ttir_with_recorded_graph_options(compiler_module, monkeypatch, options)
+    assert graph_calls == [{
+        "rule_mask": 512,
+        "ub_capacity_bytes": _stub_graph_ub_budget_bytes_for_arch(arch),
+        "compile_mode": "simd",
+        "target_arch": arch,
+    }]
 
 
 @pytest.mark.parametrize("option", [

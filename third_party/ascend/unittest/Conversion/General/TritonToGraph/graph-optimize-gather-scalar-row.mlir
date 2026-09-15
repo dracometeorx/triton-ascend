@@ -1,6 +1,6 @@
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' --triton-to-structured | FileCheck %s --check-prefix=LOWERED
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' --triton-to-structured | FileCheck %s --check-prefix=LOWERED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
 // DISABLED-NOT: tt.gather
 
 // LOWERED: tt.gather

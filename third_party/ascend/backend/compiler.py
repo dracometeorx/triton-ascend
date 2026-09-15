@@ -181,6 +181,7 @@ def make_ttir(mod, metadata, opt):
             rule_mask=opt.graph_optimize_rule_mask,
             ub_capacity_bytes=graph_ub_budget_bytes_for_arch(opt.target_arch),
             compile_mode=opt.compile_mode,
+            target_arch=opt.target_arch,
         )
     pm.run(mod, 'make_ttir')
     if opt.debug:

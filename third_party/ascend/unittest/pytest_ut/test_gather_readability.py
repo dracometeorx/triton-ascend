@@ -25,6 +25,7 @@ def run_gather_pass(tmp_path, text, **options):
     path.write_text("module {\n" + text + "\n}")
     module = ir.parse_mlir_module(str(path), context)
     pm = ir.pass_manager(module.context)
+    options.setdefault("target_arch", "Ascend910B1")
     ascend.passes.ttir.add_graph_optimize(pm, rule_mask=512, ub_capacity_bytes=96 * 1024, compile_mode="simd",
                                           **options)
     pm.run(module, "")
@@ -107,3 +108,18 @@ def test_full_row_readability(tmp_path, case, expected):
     assert ("tt.gather" in result) == expected
     # The artificial source marker in one input must not produce a fallback.
     assert ('gather.optimised.load = "fallback"' in result) == expected
+
+
+@pytest.mark.parametrize("arch,expected", [
+    ("Ascend910B1", True),
+    ("Ascend910_9391", True),
+    ("Ascend910_9589", False),
+    ("Ascend950", False),
+    ("Ascend950PR_9599", False),
+    ("", False),
+    ("unknown", False),
+])
+def test_gather_target_eligibility(tmp_path, arch, expected):
+    result = run_gather_pass(tmp_path, readable_fixture(), target_arch=arch)
+    assert ("tt.gather" in result) == expected
+    assert ("gather.optimised.load" in result) == expected

@@ -1,10 +1,14 @@
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' --triton-to-structured | FileCheck %s --check-prefix=LOWERED
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --check-prefix=DISABLED
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd_simt_template' | FileCheck %s --check-prefix=DISABLED
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=unstructured_in_simt' | FileCheck %s --check-prefix=DISABLED
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simt_only' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910_9589 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend950 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=unknown rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' --triton-to-structured | FileCheck %s --check-prefix=LOWERED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd_simt_template' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=unstructured_in_simt' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=98304 compile-mode=simt_only' | FileCheck %s --check-prefix=DISABLED
 // DISABLED-NOT: tt.gather
 // DISABLED-NOT: gather.optimised.load
 

@@ -100,7 +100,8 @@ def test_gather_rule_in_make_ttir(tmp_path, rule_mask, per_lane, volatile, index
     ir.parse_mlir_module(str(path), context)
     # A second pass must leave the transformed source/fallback alone.
     pm = ir.pass_manager(module.context)
-    ascend.passes.ttir.add_graph_optimize(pm, rule_mask=512, ub_capacity_bytes=96 * 1024, compile_mode="simd")
+    ascend.passes.ttir.add_graph_optimize(pm, rule_mask=512, ub_capacity_bytes=96 * 1024, compile_mode="simd",
+                                          target_arch="Ascend910B1")
     pm.run(module, "")
     if expected:
         assert str(module).count("tt.gather") == text.count("tt.gather")
@@ -127,10 +128,13 @@ def test_gather_rule_requires_readable_source_rows(rule_mask):
     ("Ascend910_9589", "simd_simt_template"),
     ("Ascend910_9589", "unstructured_in_simt"),
     ("Ascend910_9589", "simt_only"),
+    ("Ascend950", "simd"),
+    ("Ascend950", "simt_only"),
+    ("Ascend910_9391", "simd"),
 ])
 def test_gather_rule_requires_explicit_simd(rule_mask, arch, compile_mode):
     text = str(make_indirect_ttir(rule_mask, arch=arch, compile_mode=compile_mode))
-    expected = compile_mode == "simd" and bool(rule_mask & 512)
+    expected = compile_mode == "simd" and bool(rule_mask & 512) and arch in ("Ascend910B1", "Ascend910_9391")
     assert ("tt.gather" in text) == expected
     assert ("gather.optimised.load" in text) == expected
 
@@ -161,6 +165,8 @@ def test_gather_rule_npu_equivalence(monkeypatch, dtype, case):
     if case == "per_lane":
         reference[:, 1::2] = -7.0
     source_npu, indices_npu = source.npu(), indices.npu()
+    arch = triton.runtime.driver.active.get_current_target().arch
+    gather_target = arch.startswith(("Ascend910A", "Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B"))
     outputs = []
     for rule_mask in (511, 1023):
         indirect_rows_kernel.device_caches.clear()
@@ -184,7 +190,7 @@ def test_gather_rule_npu_equivalence(monkeypatch, dtype, case):
             compile_mode="simd",
         )
         torch.npu.synchronize()
-        expected_rewrite = rule_mask == 1023 and case not in ("per_lane", "volatile", "i64")
+        expected_rewrite = gather_target and rule_mask == 1023 and case not in ("per_lane", "volatile", "i64")
         assert ("tt.gather" in compiled.asm["ttir"]) == expected_rewrite
         outputs.append(output.cpu())
         torch.testing.assert_close(outputs[-1], reference, rtol=0, atol=0)
