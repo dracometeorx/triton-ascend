@@ -1,6 +1,6 @@
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --implicit-check-not=arith.shrsi
-// RUN: triton-opt %s --verify-each --triton-to-structured -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
+// RUN: triton-opt %s --verify-each --triton-to-structured -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
 // DISABLED-NOT: tt.gather
 
 // Covers a shape with no tt.expand_dims to anchor on: one row per scf.for

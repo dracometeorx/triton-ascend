@@ -53,8 +53,8 @@ enum class GraphOptimizationRuleId : uint16_t {
   ConvertModuloToMask = 256,
   // GatherOptimization rewrites a fully-unstructured tt.load (indices computed
   // at runtime) into a runtime-bounds-checked tt.gather with a fallback to the
-  // original load.  Its own analysis intentionally never depends on the
-  // GraphOptimizationContext analyses: see Rules/GatherOptimizationRule.cpp.
+  // original load, only in explicit SIMD mode. Its own analysis never depends
+  // on GraphOptimizationContext analyses: see Rules/GatherOptimizationRule.cpp.
   GatherOptimization = 512,
   // The following identities are owned by the layout/memory compatibility
   // passes.  They deliberately are not GraphOptimizationRule candidates and

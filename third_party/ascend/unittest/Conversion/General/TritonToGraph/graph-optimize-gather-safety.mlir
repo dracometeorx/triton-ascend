@@ -1,6 +1,6 @@
-// RUN: triton-opt %s --split-input-file --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --implicit-check-not=arith.shrsi
-// RUN: triton-opt %s --split-input-file --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=371' | FileCheck %s
-// RUN: triton-opt %s --split-input-file --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=370' | FileCheck %s --check-prefix=SMALL --implicit-check-not=tt.gather
+// RUN: triton-opt %s --split-input-file --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
+// RUN: triton-opt %s --split-input-file --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=371 compile-mode=simd' | FileCheck %s
+// RUN: triton-opt %s --split-input-file --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=370 compile-mode=simd' | FileCheck %s --check-prefix=SMALL --implicit-check-not=tt.gather
 
 // The 2x16 source and 2x8 indices estimate to 704 bytes. A half-budget
 // of 371 permits 705 bytes after the 5% margin; 370 permits only 703.

@@ -35,14 +35,20 @@ def indirect_rows_kernel(src_ptr, idx_ptr, out_ptr, n_rows, WIDTH: tl.constexpr,
         # Leave one physical row before the logical source so negative pointer
         # offsets are valid and have a different answer from wrapped indices.
         base = (rows + 1)[:, None] * WIDTH
-        value = tl.load(src_ptr + base + indices, mask, other=-7.0, volatile=VOLATILE)
+        # Keep the integer offset addition before the pointer addition. Nested
+        # addptr operations with dynamic i32 offsets cannot generally be folded
+        # together (the combined i32 sum could overflow), and are outside the
+        # gather rule's direct-pointer matcher. Test addresses fit in i32.
+        offsets = base + indices
+        value = tl.load(src_ptr + offsets, mask, other=-7.0, volatile=VOLATILE)
         # Output includes padding rows: observe `other` rather than hiding it
         # behind a masked store. The host allocates ROW_BLK rows per program.
         tl.store(out_ptr + positions, value)
 
 
-def make_indirect_ttir(rule_mask, *, per_lane=False, volatile=False, index_type="i32", value_type="fp32"):
-    options = NPUOptions(arch="Ascend910B1", graph_optimize_rule_mask=rule_mask)
+def make_indirect_ttir(rule_mask, *, per_lane=False, volatile=False, index_type="i32", value_type="fp32",
+                       compile_mode="simd", arch="Ascend910B1"):
+    options = NPUOptions(arch=arch, graph_optimize_rule_mask=rule_mask, compile_mode=compile_mode)
     source = ASTSource(
         indirect_rows_kernel,
         {"src_ptr": f"*{value_type}", "idx_ptr": f"*{index_type}", "out_ptr": f"*{value_type}", "n_rows": "i32"},
@@ -81,7 +87,7 @@ def test_gather_rule_in_make_ttir(tmp_path, rule_mask, per_lane, volatile, index
     ir.parse_mlir_module(str(path), context)
     # A second pass must leave the transformed source/fallback alone.
     pm = ir.pass_manager(module.context)
-    ascend.passes.ttir.add_graph_optimize(pm, rule_mask=512, ub_capacity_bytes=96 * 1024)
+    ascend.passes.ttir.add_graph_optimize(pm, rule_mask=512, ub_capacity_bytes=96 * 1024, compile_mode="simd")
     pm.run(module, "")
     if expected:
         assert str(module).count("tt.gather") == text.count("tt.gather")
@@ -90,6 +96,23 @@ def test_gather_rule_in_make_ttir(tmp_path, rule_mask, per_lane, volatile, index
 
 def test_gather_rule_mask_changes_cache_key():
     assert NPUOptions(graph_optimize_rule_mask=511).hash() != NPUOptions(graph_optimize_rule_mask=1023).hash()
+
+
+@pytest.mark.parametrize("rule_mask", [511, 512, 1023])
+@pytest.mark.parametrize("arch,compile_mode", [
+    ("Ascend910B1", "simd"),
+    ("Ascend910B1", "simd_simt_template"),
+    ("Ascend910B1", "unstructured_in_simt"),
+    ("Ascend910_9589", "simd"),
+    ("Ascend910_9589", "simd_simt_template"),
+    ("Ascend910_9589", "unstructured_in_simt"),
+    ("Ascend910_9589", "simt_only"),
+])
+def test_gather_rule_requires_explicit_simd(rule_mask, arch, compile_mode):
+    text = str(make_indirect_ttir(rule_mask, arch=arch, compile_mode=compile_mode))
+    expected = compile_mode == "simd" and bool(rule_mask & 512)
+    assert ("tt.gather" in text) == expected
+    assert ("gather.optimised.load" in text) == expected
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
@@ -134,6 +157,7 @@ def test_gather_rule_npu_equivalence(monkeypatch, dtype, case):
             PER_LANE=case == "per_lane",
             VOLATILE=case == "volatile",
             graph_optimize_rule_mask=rule_mask,
+            compile_mode="simd",
         )
         torch.npu.synchronize()
         expected_rewrite = rule_mask == 1023 and case not in ("per_lane", "volatile", "i64")

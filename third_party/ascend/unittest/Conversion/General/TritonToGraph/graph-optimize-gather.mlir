@@ -1,9 +1,15 @@
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --implicit-check-not=arith.shrsi
-// RUN: triton-opt %s --verify-each --triton-to-structured -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s
-// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
+// RUN: triton-opt %s --verify-each --triton-to-structured -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd_simt_template' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=unstructured_in_simt' | FileCheck %s --check-prefix=DISABLED
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simt_only' | FileCheck %s --check-prefix=DISABLED
 // DISABLED-NOT: tt.gather
+// DISABLED-NOT: gather.optimised.load
 
 // A looped, tensor-built (tt.expand_dims/tt.broadcast) gather.
+// Even on A2/A3, default/template modes must not run the explicit-SIMD rule.
 
 // CHECK: arith.select
 // CHECK: arith.minsi

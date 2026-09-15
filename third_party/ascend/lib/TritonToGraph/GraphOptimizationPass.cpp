@@ -516,7 +516,11 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::StoreCoalescing)) {
     rules.push_back(createStoreCoalescingRule(options.ubCapacityBytes));
   }
-  if (isRuleEnabled(options.enabledRuleMask,
+  // The full-row preload and gather cost model is supported only for explicit
+  // SIMD. Template mode can lower indirect accesses through SIMT on A5.
+  if (triton::ascend::parseCompileMode(options.compileMode) ==
+          triton::ascend::CompileMode::Simd &&
+      isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::GatherOptimization)) {
     rules.push_back(createGatherOptimizationRule(options.ubCapacityBytes));
   }
