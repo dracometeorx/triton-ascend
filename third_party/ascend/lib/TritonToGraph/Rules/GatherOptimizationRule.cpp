@@ -34,6 +34,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -341,6 +342,81 @@ Value findAxisInvariantValue(Value value, ArrayRef<int64_t> srcShape,
     if (type.getDimSize(axis) != 1 && type.getDimSize(axis) != srcShape[axis])
       return {};
   return value;
+}
+
+// Recognize exactly [0, sourceWidth), broadcast along the other axes.
+bool isFullLastAxisRange(Value value, int64_t sourceWidth) {
+  while (true) {
+    if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
+      value = broadcast.getSrc();
+    } else if (auto expand = value.getDefiningOp<triton::ExpandDimsOp>()) {
+      auto type = cast<RankedTensorType>(value.getType());
+      if (expand.getAxis() == type.getRank() - 1)
+        return false;
+      value = expand.getSrc();
+    } else {
+      break;
+    }
+  }
+  auto range = value.getDefiningOp<triton::MakeRangeOp>();
+  return range && range.getStart() == 0 && range.getEnd() == sourceWidth;
+}
+
+// A row stride and in-range indices do not prove that expanding a read to
+// the entire row is legal (the argument may point inside an allocation).
+// Require an existing read of precisely that row, already executed in this
+// block. Do not cross effects or control flow that could invalidate the
+// proof, and never use this rule's generated loads to justify another one.
+bool hasFullRowReadWitness(const GatherCandidate &candidate) {
+  triton::LoadOp candidateLoad = candidate.loadOp;
+  auto elementType =
+      cast<RankedTensorType>(candidateLoad.getType()).getElementType();
+  for (Operation *op = candidate.loadOp->getPrevNode(); op;
+       op = op->getPrevNode()) {
+    auto load = dyn_cast<triton::LoadOp>(op);
+    if (!load) {
+      if (op->getNumRegions() || !isMemoryEffectFree(op))
+        break;
+      continue;
+    }
+    if (load.getIsVolatile())
+      break;
+    if (load->hasAttr(kGatherOptimisedLoadAttr) ||
+        load.getResult().use_empty() || !load.getBoundaryCheck().empty())
+      continue;
+    auto type = dyn_cast<RankedTensorType>(load.getType());
+    if (!type || type.getEncoding() || type.getShape() != candidate.srcShape ||
+        type.getElementType() != elementType)
+      continue;
+    auto addPtr = load.getPtr().getDefiningOp<triton::AddPtrOp>();
+    if (!addPtr)
+      continue;
+    auto splat = addPtr.getPtr().getDefiningOp<triton::SplatOp>();
+    auto offsets = addPtr.getOffset().getDefiningOp<arith::AddIOp>();
+    auto offsetType = dyn_cast<RankedTensorType>(addPtr.getOffset().getType());
+    if (!splat || splat.getSrc() != candidate.srcPtr || !offsets ||
+        !offsetType || !offsetType.getElementType().isInteger(32))
+      continue;
+    auto matches = [&](Value base, Value columns) {
+      return findAxisInvariantValue(base, candidate.srcShape,
+                                    candidate.gatherAxis) ==
+                 candidate.sourceBase &&
+             isFullLastAxisRange(columns, candidate.srcShape.back());
+    };
+    if (!matches(offsets.getLhs(), offsets.getRhs()) &&
+        !matches(offsets.getRhs(), offsets.getLhs()))
+      continue;
+    // An unmasked read proves all rows readable. Otherwise require exactly
+    // the same row predicate; a narrower or per-column mask proves less.
+    if (Value mask = load.getMask()) {
+      if (!candidate.sourceMask ||
+          findAxisInvariantValue(mask, candidate.srcShape,
+                                 candidate.gatherAxis) != candidate.sourceMask)
+        continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 std::optional<uint64_t> getByteWidth(Type type) {
@@ -884,6 +960,13 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
         findAxisInvariantValue(mask, candidate.srcShape, candidate.gatherAxis);
     if (!candidate.sourceMask)
       return std::nullopt;
+  }
+
+  if (!hasFullRowReadWitness(candidate)) {
+    LLVM_DEBUG(
+        llvm::dbgs()
+        << "[GatherOptimization] full source row readability is unproven\n");
+    return std::nullopt;
   }
 
   if (exceedsUbCapacity(candidate.srcShape, loadTensorType.getShape(),

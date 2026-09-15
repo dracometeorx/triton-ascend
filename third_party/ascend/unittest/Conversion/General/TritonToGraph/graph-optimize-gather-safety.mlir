@@ -18,7 +18,7 @@
 // CHECK: gather.optimised.load = "fallback"
 // CHECK: tt.return
 
-tt.func @unmasked_base_bias(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -> tensor<2x8xf32> {
+tt.func @unmasked_base_bias(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -> (tensor<2x8xf32>, tensor<2x16xf32>) {
   %rows = tt.make_range {start = 3 : i32, end = 5 : i32} : tensor<2xi32>
   %bias_tensor = tt.splat %bias : i32 -> tensor<2xi32>
   %biased = arith.addi %rows, %bias_tensor : tensor<2xi32>
@@ -31,8 +31,16 @@ tt.func @unmasked_base_bias(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) 
   %offsets = arith.addi %base_grid, %indices : tensor<2x8xi32>
   %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<2x8x!tt.ptr<f32>>
   %ptrs = tt.addptr %src_ptrs, %offsets : tensor<2x8x!tt.ptr<f32>>, tensor<2x8xi32>
+  %readable_cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+  %readable_cols_0 = tt.expand_dims %readable_cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+  %readable_grid = tt.broadcast %readable_cols_0 : tensor<1x16xi32> -> tensor<2x16xi32>
+  %readable_base = tt.broadcast %base : tensor<2x1xi32> -> tensor<2x16xi32>
+  %readable_offsets = arith.addi %readable_base, %readable_grid : tensor<2x16xi32>
+  %readable_src = tt.splat %src : !tt.ptr<f32> -> tensor<2x16x!tt.ptr<f32>>
+  %readable_ptrs = tt.addptr %readable_src, %readable_offsets : tensor<2x16x!tt.ptr<f32>>, tensor<2x16xi32>
+  %readable = tt.load %readable_ptrs : tensor<2x16x!tt.ptr<f32>>
   %value = tt.load %ptrs : tensor<2x8x!tt.ptr<f32>>
-  tt.return %value : tensor<2x8xf32>
+  tt.return %value, %readable : tensor<2x8xf32>, tensor<2x16xf32>
 }
 
 // -----
@@ -50,7 +58,7 @@ tt.func @unmasked_base_bias(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) 
 // CHECK: gather.optimised.load = "fallback"
 // CHECK: tt.return
 
-tt.func @row_mask_other(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, %mask: tensor<2x1xi1>) -> tensor<2x8xf32> {
+tt.func @row_mask_other(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, %mask: tensor<2x1xi1>) -> (tensor<2x8xf32>, tensor<2x16xf32>) {
   %rows = tt.make_range {start = 3 : i32, end = 5 : i32} : tensor<2xi32>
   %bias_tensor = tt.splat %bias : i32 -> tensor<2xi32>
   %biased = arith.addi %rows, %bias_tensor : tensor<2xi32>
@@ -65,8 +73,18 @@ tt.func @row_mask_other(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, %mas
   %ptrs = tt.addptr %src_ptrs, %offsets : tensor<2x8x!tt.ptr<f32>>, tensor<2x8xi32>
   %mask_grid = tt.broadcast %mask : tensor<2x1xi1> -> tensor<2x8xi1>
   %other = arith.constant dense<-7.0> : tensor<2x8xf32>
+  %readable_cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+  %readable_cols_0 = tt.expand_dims %readable_cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+  %readable_grid = tt.broadcast %readable_cols_0 : tensor<1x16xi32> -> tensor<2x16xi32>
+  %readable_base = tt.broadcast %base : tensor<2x1xi32> -> tensor<2x16xi32>
+  %readable_offsets = arith.addi %readable_base, %readable_grid : tensor<2x16xi32>
+  %readable_src = tt.splat %src : !tt.ptr<f32> -> tensor<2x16x!tt.ptr<f32>>
+  %readable_ptrs = tt.addptr %readable_src, %readable_offsets : tensor<2x16x!tt.ptr<f32>>, tensor<2x16xi32>
+  %readable_mask = tt.broadcast %mask : tensor<2x1xi1> -> tensor<2x16xi1>
+  %readable_zero = arith.constant dense<0.0> : tensor<2x16xf32>
+  %readable = tt.load %readable_ptrs, %readable_mask, %readable_zero : tensor<2x16x!tt.ptr<f32>>
   %value = tt.load %ptrs, %mask_grid, %other : tensor<2x8x!tt.ptr<f32>>
-  tt.return %value : tensor<2x8xf32>
+  tt.return %value, %readable : tensor<2x8xf32>, tensor<2x16xf32>
 }
 
 // -----
@@ -75,7 +93,7 @@ tt.func @row_mask_other(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, %mas
 // CHECK-NOT: tt.gather
 // CHECK: tt.return
 
-tt.func @lane_mask_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, %mask: tensor<2x8xi1>) -> tensor<2x8xf32> {
+tt.func @lane_mask_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, %mask: tensor<2x8xi1>) -> (tensor<2x8xf32>, tensor<2x16xf32>) {
   %rows = tt.make_range {start = 3 : i32, end = 5 : i32} : tensor<2xi32>
   %bias_tensor = tt.splat %bias : i32 -> tensor<2xi32>
   %biased = arith.addi %rows, %bias_tensor : tensor<2xi32>
@@ -90,8 +108,16 @@ tt.func @lane_mask_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, 
   %ptrs = tt.addptr %src_ptrs, %offsets : tensor<2x8x!tt.ptr<f32>>, tensor<2x8xi32>
   %mask_grid = arith.andi %mask, %mask : tensor<2x8xi1>
   %other = arith.constant dense<-7.0> : tensor<2x8xf32>
+  %readable_cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+  %readable_cols_0 = tt.expand_dims %readable_cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+  %readable_grid = tt.broadcast %readable_cols_0 : tensor<1x16xi32> -> tensor<2x16xi32>
+  %readable_base = tt.broadcast %base : tensor<2x1xi32> -> tensor<2x16xi32>
+  %readable_offsets = arith.addi %readable_base, %readable_grid : tensor<2x16xi32>
+  %readable_src = tt.splat %src : !tt.ptr<f32> -> tensor<2x16x!tt.ptr<f32>>
+  %readable_ptrs = tt.addptr %readable_src, %readable_offsets : tensor<2x16x!tt.ptr<f32>>, tensor<2x16xi32>
+  %readable = tt.load %readable_ptrs : tensor<2x16x!tt.ptr<f32>>
   %value = tt.load %ptrs, %mask_grid, %other : tensor<2x8x!tt.ptr<f32>>
-  tt.return %value : tensor<2x8xf32>
+  tt.return %value, %readable : tensor<2x8xf32>, tensor<2x16xf32>
 }
 
 // -----
@@ -100,7 +126,7 @@ tt.func @lane_mask_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32, 
 // CHECK-NOT: tt.gather
 // CHECK: tt.return
 
-tt.func @volatile_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -> tensor<2x8xf32> {
+tt.func @volatile_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -> (tensor<2x8xf32>, tensor<2x16xf32>) {
   %rows = tt.make_range {start = 3 : i32, end = 5 : i32} : tensor<2xi32>
   %bias_tensor = tt.splat %bias : i32 -> tensor<2xi32>
   %biased = arith.addi %rows, %bias_tensor : tensor<2xi32>
@@ -113,8 +139,16 @@ tt.func @volatile_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -
   %offsets = arith.addi %base_grid, %indices : tensor<2x8xi32>
   %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<2x8x!tt.ptr<f32>>
   %ptrs = tt.addptr %src_ptrs, %offsets : tensor<2x8x!tt.ptr<f32>>, tensor<2x8xi32>
+  %readable_cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+  %readable_cols_0 = tt.expand_dims %readable_cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+  %readable_grid = tt.broadcast %readable_cols_0 : tensor<1x16xi32> -> tensor<2x16xi32>
+  %readable_base = tt.broadcast %base : tensor<2x1xi32> -> tensor<2x16xi32>
+  %readable_offsets = arith.addi %readable_base, %readable_grid : tensor<2x16xi32>
+  %readable_src = tt.splat %src : !tt.ptr<f32> -> tensor<2x16x!tt.ptr<f32>>
+  %readable_ptrs = tt.addptr %readable_src, %readable_offsets : tensor<2x16x!tt.ptr<f32>>, tensor<2x16xi32>
+  %readable = tt.load %readable_ptrs : tensor<2x16x!tt.ptr<f32>>
   %value = tt.load %ptrs {isVolatile = true} : tensor<2x8x!tt.ptr<f32>>
-  tt.return %value : tensor<2x8xf32>
+  tt.return %value, %readable : tensor<2x8xf32>, tensor<2x16xf32>
 }
 
 // -----
@@ -178,7 +212,7 @@ tt.func @negative_extent_rejected(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias:
 // More than 64 classified Values force recursive DenseMap growth.
 // Run this case with an ASan-enabled triton-opt to catch dangling buckets.
 
-tt.func @deep_offset_cache(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -> tensor<2x8xf32> {
+tt.func @deep_offset_cache(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -> (tensor<2x8xf32>, tensor<2x16xf32>) {
   %rows = tt.make_range {start = 3 : i32, end = 5 : i32} : tensor<2xi32>
   %bias_tensor = tt.splat %bias : i32 -> tensor<2xi32>
   %biased = arith.addi %rows, %bias_tensor : tensor<2xi32>
@@ -287,8 +321,16 @@ tt.func @deep_offset_cache(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %bias: i32) -
   %offsets = arith.addi %base_grid, %indices : tensor<2x8xi32>
   %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<2x8x!tt.ptr<f32>>
   %ptrs = tt.addptr %src_ptrs, %offsets : tensor<2x8x!tt.ptr<f32>>, tensor<2x8xi32>
+  %readable_cols = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+  %readable_cols_0 = tt.expand_dims %readable_cols {axis = 0 : i32} : tensor<16xi32> -> tensor<1x16xi32>
+  %readable_grid = tt.broadcast %readable_cols_0 : tensor<1x16xi32> -> tensor<2x16xi32>
+  %readable_base = tt.broadcast %base : tensor<2x1xi32> -> tensor<2x16xi32>
+  %readable_offsets = arith.addi %readable_base, %readable_grid : tensor<2x16xi32>
+  %readable_src = tt.splat %src : !tt.ptr<f32> -> tensor<2x16x!tt.ptr<f32>>
+  %readable_ptrs = tt.addptr %readable_src, %readable_offsets : tensor<2x16x!tt.ptr<f32>>, tensor<2x16xi32>
+  %readable = tt.load %readable_ptrs : tensor<2x16x!tt.ptr<f32>>
   %value = tt.load %ptrs : tensor<2x8x!tt.ptr<f32>>
-  tt.return %value : tensor<2x8xf32>
+  tt.return %value, %readable : tensor<2x8xf32>, tensor<2x16xf32>
 }
 
 // -----

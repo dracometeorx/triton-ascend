@@ -1,8 +1,10 @@
 // RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s --implicit-check-not=arith.shrsi
-// RUN: triton-opt %s --verify-each --triton-to-structured -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' | FileCheck %s
+// RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=98304 compile-mode=simd' --triton-to-structured | FileCheck %s --check-prefix=LOWERED
 // RUN: triton-opt %s --verify-each -graph-optimize='rule-mask=512 ub-capacity-bytes=1 compile-mode=simd' | FileCheck %s --check-prefix=DISABLED
 // DISABLED-NOT: tt.gather
 
+// LOWERED: tt.gather
+// The early Gather rewrite must remain valid through structured conversion.
 // Covers a shape with no tt.expand_dims to anchor on: one row per scf.for
 // iteration, so the source offset is a scalar splat instead of built up
 // axis by axis. See findScalarAxisDimension in GatherOptimizationRule.cpp.
@@ -21,7 +23,7 @@
 // CHECK:   tt.load {{%[0-9]+, %[0-9]+, %cst_[0-9]+}} {gather.optimised.load = "fallback"} : tensor<1x4096x!tt.ptr<f32>>
 
 module attributes {hacc.target = #hacc.target<"Ascend910B3">} {
-  tt.func public @indirect_load_nd(%src_ptr: !tt.ptr<f32>, %idx_ptr: !tt.ptr<i32>, %out_ptr: !tt.ptr<f32>) attributes {noinline = false} {
+  tt.func public @indirect_load_nd(%src_ptr: !tt.ptr<f32>, %idx_ptr: !tt.ptr<i32>, %out_ptr: !tt.ptr<f32>, %witness_sink: !tt.ptr<f32>) attributes {noinline = false} {
     %c4096_i32 = arith.constant 4096 : i32
     %c1024_i32 = arith.constant 1024 : i32
     %cst = arith.constant dense<-7.000000e+00> : tensor<1x4096xf32>
@@ -52,7 +54,20 @@ module attributes {hacc.target = #hacc.target<"Ascend910B3">} {
       %in_offsets = tt.splat %in_offsets_base_4 : i32 -> tensor<1x4096xi32>
       %in_offsets_11 = arith.addi %in_offsets, %idx_10 : tensor<1x4096xi32>
       %out_12 = tt.addptr %out, %in_offsets_11 : tensor<1x4096x!tt.ptr<f32>>, tensor<1x4096xi32>
+      %readable_cols = tt.make_range {start = 0 : i32, end = 1024 : i32} : tensor<1024xi32>
+      %readable_cols_0 = tt.expand_dims %readable_cols {axis = 0 : i32} : tensor<1024xi32> -> tensor<1x1024xi32>
+      %readable_grid = tt.broadcast %readable_cols_0 : tensor<1x1024xi32> -> tensor<1x1024xi32>
+      %readable_base = tt.splat %in_offsets_base_4 : i32 -> tensor<1x1024xi32>
+      %readable_offsets = arith.addi %readable_base, %readable_grid : tensor<1x1024xi32>
+      %readable_src = tt.splat %src_ptr : !tt.ptr<f32> -> tensor<1x1024x!tt.ptr<f32>>
+      %readable_ptrs = tt.addptr %readable_src, %readable_offsets : tensor<1x1024x!tt.ptr<f32>>, tensor<1x1024xi32>
+      %readable_mask = tt.splat %mask : i1 -> tensor<1x1024xi1>
+      %readable_zero = arith.constant dense<0.0> : tensor<1x1024xf32>
+      %readable = tt.load %readable_ptrs, %readable_mask, %readable_zero : tensor<1x1024x!tt.ptr<f32>>
       %out_13 = tt.load %out_12, %idx_9, %cst : tensor<1x4096x!tt.ptr<f32>>
+      %readable_sink = tt.splat %witness_sink : !tt.ptr<f32> -> tensor<1x1024x!tt.ptr<f32>>
+      %readable_out = tt.addptr %readable_sink, %readable_offsets : tensor<1x1024x!tt.ptr<f32>>, tensor<1x1024xi32>
+      tt.store %readable_out, %readable, %readable_mask : tensor<1x1024x!tt.ptr<f32>>
       %1 = tt.addptr %0, %idx_offsets_7 : tensor<1x4096x!tt.ptr<f32>>, tensor<1x4096xi32>
       tt.store %1, %out_13, %idx_9 : tensor<1x4096x!tt.ptr<f32>>
     }
