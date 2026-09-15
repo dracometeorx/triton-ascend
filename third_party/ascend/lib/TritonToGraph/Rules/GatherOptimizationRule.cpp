@@ -588,13 +588,14 @@ int gatherIterBucket(int64_t iterations) {
 
 // True if rewriting to tt.gather is expected to be at least as fast as the
 // scalar baseline it replaces. srcLast/idxLast are the gather axis sizes;
-// rowBlk is the rows assigned to one core, rowStep the rows the scalar
-// baseline processes per tile iteration (its own tiling, distinct from
-// exceedsUbCapacity's tt.gather-side UB budget above).
-bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast, int64_t rowBlk,
-                             int64_t rowStep, uint64_t elemBytes) {
+// iterations counts the enclosing row loop; rowStep is the number of rows
+// processed per iteration (distinct from the Gather-side UB budget above).
+bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast,
+                             int64_t iterations, int64_t rowStep,
+                             uint64_t elemBytes) {
   const bool isHalf = elemBytes < 4;
-  const int64_t iterations = (rowBlk + rowStep - 1) / rowStep;
+  if (iterations <= 0)
+    return false;
 
   // A width-1 source gather axis is a degenerate case with its own, much
   // later crossing point: tt.gather still pays a full tile load and the
@@ -629,23 +630,6 @@ bool exceedsBenefitThreshold(int64_t srcLast, int64_t idxLast, int64_t rowBlk,
          idxLast;
 }
 
-// rowBlk: the upper bound of the nearest enclosing scf.for whose step
-// matches rowStep -- the loop tiling the row dimension into rowStep-sized
-// chunks. Searched from the matched op, not rowOffset's defining op:
-// rowOffset (`program_id * rowBlk`) is typically hoisted outside that loop.
-// No matching loop -> the whole block runs in one shot, rowBlk == rowStep.
-int64_t findRowBlk(Operation *anchor, int64_t rowStep) {
-  auto forOp = anchor->getParentOfType<scf::ForOp>();
-  if (!forOp)
-    return rowStep;
-  std::optional<int64_t> step = getConstantIntValue(forOp.getStep());
-  std::optional<int64_t> upperBound =
-      getConstantIntValue(forOp.getUpperBound());
-  if (!step || *step != rowStep || !upperBound)
-    return rowStep;
-  return *upperBound;
-}
-
 // Extracts the single splat integer constant multiplied in `mulI`.
 std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   arith::ConstantOp constOp = mulI.getRhs().getDefiningOp<arith::ConstantOp>();
@@ -661,6 +645,99 @@ std::optional<int64_t> extractMulIConstant(arith::MulIOp mulI) {
   if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
     return intAttr.getInt();
   return std::nullopt;
+}
+
+// Saturate only after computing ceil((upper - lower) / step). Unsigned
+// subtraction handles the full signed-bound range without signed overflow;
+// adding the remainder bit cannot overflow a positive-step quotient.
+int64_t constantTripCount(int64_t lower, int64_t upper, int64_t step) {
+  if (step <= 0)
+    return 1;
+  if (upper <= lower)
+    return 0;
+  uint64_t distance =
+      static_cast<uint64_t>(upper) - static_cast<uint64_t>(lower);
+  uint64_t stride = static_cast<uint64_t>(step);
+  uint64_t count = distance / stride + (distance % stride != 0);
+  return static_cast<int64_t>(std::min(
+      count, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+}
+
+// Recover a nonnegative affine coefficient of this loop's IV in the row
+// offsets. Unknown arithmetic and cancellation must not make an unrelated
+// (or invariant) row appear to be driven by a long enclosing loop.
+std::optional<uint64_t>
+rowIvCoefficient(Value value, scf::ForOp loop,
+                 DenseMap<Value, std::optional<uint64_t>> &cache) {
+  auto found = cache.find(value);
+  if (found != cache.end())
+    return found->second;
+  auto compute = [&]() -> std::optional<uint64_t> {
+    if (value == loop.getInductionVar())
+      return 1;
+    if (loop.isDefinedOutsideOfLoop(value))
+      return 0;
+    Operation *op = value.getDefiningOp();
+    if (!op)
+      return std::nullopt;
+    if (isa<arith::ConstantOp, triton::MakeRangeOp, triton::GetProgramIdOp>(op))
+      return 0;
+    if (isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp>(op))
+      return rowIvCoefficient(op->getOperand(0), loop, cache);
+    if (isa<arith::AddIOp, arith::SubIOp>(op)) {
+      auto lhs = rowIvCoefficient(op->getOperand(0), loop, cache);
+      auto rhs = rowIvCoefficient(op->getOperand(1), loop, cache);
+      if (!lhs || !rhs)
+        return std::nullopt;
+      uint64_t result;
+      if (isa<arith::SubIOp>(op)) {
+        if (*lhs < *rhs)
+          return std::nullopt;
+        result = *lhs - *rhs;
+      } else if (!checkedAddU64(*lhs, *rhs, result)) {
+        return std::nullopt;
+      }
+      return result;
+    }
+    if (auto mul = dyn_cast<arith::MulIOp>(op)) {
+      auto factor = extractMulIConstant(mul);
+      if (!factor || *factor <= 0)
+        return std::nullopt;
+      Value carrier = mul.getRhs().getDefiningOp<arith::ConstantOp>()
+                          ? mul.getLhs()
+                          : mul.getRhs();
+      auto coefficient = rowIvCoefficient(carrier, loop, cache);
+      uint64_t result;
+      if (!coefficient || !checkedMulU64(*coefficient, *factor, result))
+        return std::nullopt;
+      return result;
+    }
+    return std::nullopt;
+  };
+  auto coefficient = compute();
+  // Row offsets are i32. A coefficient that wraps to zero is not evidence
+  // that the loop advances the row; reject large coefficients outright.
+  if (coefficient && *coefficient > std::numeric_limits<int32_t>::max())
+    coefficient = std::nullopt;
+  cache.try_emplace(value, coefficient);
+  return coefficient;
+}
+
+int64_t findRowIterations(Operation *anchor, Value sourceBase,
+                          int64_t rowStep) {
+  auto loop = anchor->getParentOfType<scf::ForOp>();
+  if (!loop)
+    return 1;
+  auto step = getConstantIntValue(loop.getStep());
+  auto lower = getConstantIntValue(loop.getLowerBound());
+  auto upper = getConstantIntValue(loop.getUpperBound());
+  if (!step || *step <= 0 || *step != rowStep || !lower || !upper)
+    return 1;
+  DenseMap<Value, std::optional<uint64_t>> cache;
+  auto coefficient = rowIvCoefficient(sourceBase, loop, cache);
+  if (!coefficient || *coefficient == 0)
+    return 1;
+  return constantTripCount(*lower, *upper, *step);
 }
 
 // Searches backward from searchRoot (anchored on the pointer side), so a
@@ -980,16 +1057,17 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
   }
 
   // The matched pattern's own row-dim size is the scalar baseline's
-  // per-iteration row count (rowStep); see findRowBlk for how rowBlk is
-  // recovered from the loop tiling it.
+  // per-iteration row count (rowStep). Unknown loop bounds or row dependence
+  // use the most conservative, single-iteration benefit bucket.
   std::optional<uint64_t> loadElemBytes =
       getByteWidth(loadTensorType.getElementType());
   if (!loadElemBytes)
     return std::nullopt;
   int64_t rowStep = candidate.srcShape[0];
-  int64_t rowBlk = findRowBlk(candidate.addPtrOp, rowStep);
+  int64_t iterations =
+      findRowIterations(candidate.addPtrOp, candidate.sourceBase, rowStep);
   if (!exceedsBenefitThreshold(candidate.srcShape.back(), indexShape.back(),
-                               rowBlk, rowStep, *loadElemBytes)) {
+                               iterations, rowStep, *loadElemBytes)) {
     LLVM_DEBUG(llvm::dbgs()
                << "[GatherOptimization] rewrite not expected to beat the "
                   "scalar baseline\n");
