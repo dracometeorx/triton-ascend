@@ -82,6 +82,8 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
            "Unified-buffer capacity available to StoreCoalescing">,
     Option<"compileMode", "compile-mode", "std::string", "\"simd_simt_template\"",
            "Compilation mode; RowCoalescing is enabled only for simt_only">,
+    Option<"targetArch", "target-arch", "std::string", "\"\"",
+           "Target architecture for Gather eligibility; empty or unsupported targets disable Gather">,
   ];
 }
 

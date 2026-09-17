@@ -25,6 +25,8 @@
 #include "TritonToGraph/Passes.h"
 #include "Utils/Utils.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/DenseMap.h"
@@ -139,10 +141,12 @@ public:
     this->maxRewritesPerFunction = options.maxRewritesPerFunction;
     this->ubCapacityBytes = options.ubCapacityBytes;
     this->compileMode = options.compileMode;
+    this->targetArch = options.targetArch;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<tensor::TensorDialect>();
+    registry
+        .insert<arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() override;
@@ -189,6 +193,7 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
   options.maxRewritesPerFunction = static_cast<unsigned>(cliMaxRewrites);
   options.ubCapacityBytes = static_cast<unsigned>(cliUBCapacityBytes);
   options.compileMode = this->compileMode;
+  options.targetArch = this->targetArch;
   return success();
 }
 
@@ -210,11 +215,11 @@ void GraphOptimizePass::runOnOperation() {
 
   LLVM_DEBUG({
     llvm::dbgs() << "[graph-optimize] rule-mask="
-                << static_cast<unsigned>(options.enabledRuleMask)
-                << " max-rewrites-per-function="
-                << options.maxRewritesPerFunction
-                << " compile-mode=" << options.compileMode
-                << " enabled rules:";
+                 << static_cast<unsigned>(options.enabledRuleMask)
+                 << " max-rewrites-per-function="
+                 << options.maxRewritesPerFunction
+                 << " compile-mode=" << options.compileMode
+                 << " target-arch=" << options.targetArch << " enabled rules:";
     for (GraphOptimizationRule *rule : enabledRules)
       llvm::dbgs() << " " << ruleIdToString(rule->getId());
     llvm::dbgs() << "\n";
@@ -513,7 +518,15 @@ void populateBuiltinGraphOptimizationRules(
                     GraphOptimizationRuleId::StoreCoalescing)) {
     rules.push_back(createStoreCoalescingRule(options.ubCapacityBytes));
   }
-  if (isRuleEnabled(options.enabledRuleMask,
+  // Enable Gather on known A2/A3 targets independently of the compile-mode
+  // selector: their default/template mode also uses the SIMD lowering path.
+  // A5 treats tt.gather as a SIMT operation, so its lowering and cost model
+  // require separate validation. Other and unknown targets decline as well.
+  llvm::StringRef target = options.targetArch;
+  bool gatherTarget =
+      target.starts_with("Ascend910B") || target.starts_with("Ascend910_93");
+  if (gatherTarget &&
+      isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::GatherOptimization)) {
     rules.push_back(createGatherOptimizationRule(options.ubCapacityBytes));
   }

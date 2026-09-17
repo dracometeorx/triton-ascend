@@ -53,8 +53,9 @@ enum class GraphOptimizationRuleId : uint16_t {
   ConvertModuloToMask = 256,
   // GatherOptimization rewrites a fully-unstructured tt.load (indices computed
   // at runtime) into a runtime-bounds-checked tt.gather with a fallback to the
-  // original load.  Its own analysis intentionally never depends on the
-  // GraphOptimizationContext analyses: see Rules/GatherOptimizationRule.cpp.
+  // original load on A2/A3, independent of compile mode. Its analysis never
+  // depends on GraphOptimizationContext analyses: see
+  // Rules/GatherOptimizationRule.cpp.
   GatherOptimization = 512,
   // The following identities are owned by the layout/memory compatibility
   // passes.  They deliberately are not GraphOptimizationRule candidates and
@@ -127,6 +128,9 @@ struct GraphOptimizationOptions {
   // compile_mode="simt_only".  Keep the source selector rather than a
   // second derived force flag so every consumer follows one mode contract.
   std::string compileMode = "simd_simt_template";
+  // Internal target forwarded from the backend; Gather declines unknown
+  // targets.
+  std::string targetArch;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>>
