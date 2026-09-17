@@ -159,8 +159,7 @@ private:
     auto dstShape = dstType.getShape();
     dstStructured.resize(srcStructured.size());
     for (size_t i = 0; i < dstStructured.size(); i++) {
-      if (llvm::find(broadcastDim, i) != broadcastDim.end() &&
-          dstShape[i] != 1)
+      if (llvm::find(broadcastDim, i) != broadcastDim.end() && dstShape[i] != 1)
         dstStructured[i] = AxisInfo::scalarlike;
       else
         dstStructured[i] = srcStructured[i];
@@ -222,9 +221,9 @@ private:
       if (auto mulI = dyn_cast<arith::MulIOp>(defOp))
         return combineMulI(classify(mulI.getLhs()), classify(mulI.getRhs()));
       if (isa<arith::RemSIOp, arith::DivSIOp, arith::MulFOp, arith::DivFOp,
-              arith::AddFOp, arith::SubFOp, arith::MinNumFOp,
-              arith::MaxNumFOp, arith::MaxSIOp, arith::MinSIOp,
-              arith::CmpIOp, arith::AndIOp, arith::OrIOp>(defOp))
+              arith::AddFOp, arith::SubFOp, arith::MinNumFOp, arith::MaxNumFOp,
+              arith::MaxSIOp, arith::MinSIOp, arith::CmpIOp, arith::AndIOp,
+              arith::OrIOp>(defOp))
         return combineBinaryLike(classify(defOp->getOperand(0)),
                                  classify(defOp->getOperand(1)));
       if (auto expandDims = dyn_cast<triton::ExpandDimsOp>(defOp))
@@ -236,11 +235,11 @@ private:
             dyn_cast<RankedTensorType>(broadcast.getResult().getType());
         if (!srcType || !dstType)
           return unstructuredLike(value);
-        return combineBroadcast(classify(broadcast.getSrc()), srcType,
-                                dstType);
+        return combineBroadcast(classify(broadcast.getSrc()), srcType, dstType);
       }
       if (auto splat = dyn_cast<triton::SplatOp>(defOp)) {
-        if (auto dstType = dyn_cast<RankedTensorType>(splat.getResult().getType()))
+        if (auto dstType =
+                dyn_cast<RankedTensorType>(splat.getResult().getType()))
           return splatTagging(dstType);
         return unstructuredLike(value);
       }
@@ -290,7 +289,8 @@ private:
 
 // Marks a tt.load this rule generated (the source/fallback load in a
 // scf.if), so findCandidates skips it.
-constexpr llvm::StringLiteral kGatherOptimisedLoadAttr = "gather.optimised.load";
+constexpr llvm::StringLiteral kGatherOptimisedLoadAttr =
+    "gather.optimised.load";
 
 struct GatherCandidate {
   triton::LoadOp loadOp;
@@ -433,8 +433,8 @@ bool exceedsUbCapacity(ArrayRef<int64_t> srcShape,
   if (!checkedMulU64(*srcTileBytes, kSrcTileMultiplier, srcContribution) ||
       !checkedMulU64(*idxAtLoadElemBytes, kIndexFootprintAtLoadElemMultiplier,
                      idxContribution1) ||
-      !checkedMulU64(*idxAtIndexElemBytes,
-                     kIndexFootprintAtIndexElemMultiplier, idxContribution2) ||
+      !checkedMulU64(*idxAtIndexElemBytes, kIndexFootprintAtIndexElemMultiplier,
+                     idxContribution2) ||
       !checkedAddU64(srcContribution, idxContribution1, total) ||
       !checkedAddU64(total, idxContribution2, total))
     return true;
@@ -671,8 +671,8 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
   std::function<bool(Operation *)> isMulIOfThisAxis =
       [&](Operation *op) -> bool {
     auto mulI = dyn_cast<arith::MulIOp>(op);
-    return mulI && (isAxisExpandDims(mulI.getLhs()) ||
-                    isAxisExpandDims(mulI.getRhs()));
+    return mulI &&
+           (isAxisExpandDims(mulI.getLhs()) || isAxisExpandDims(mulI.getRhs()));
   };
   std::function<bool(Operation *)> leavesSourceRegion =
       [&](Operation *op) -> bool {
@@ -689,8 +689,8 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
 // Last resort: an unmultiplied tt.expand_dims means its multiplier
 // canonicalized away as arith.muli(x, 1), so the dimension is 1.
 std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
-                                                    Operation *indicesOp,
-                                                    int64_t axis) {
+                                                   Operation *indicesOp,
+                                                   int64_t axis) {
   std::function<bool(Operation *)> isThisAxisExpandDims =
       [axis](Operation *op) -> bool {
     auto expandDims = dyn_cast<triton::ExpandDimsOp>(op);
@@ -700,9 +700,8 @@ std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
       [&](Operation *op) -> bool {
     return op == indicesOp || isSplatOfBlockArgPointer(op);
   };
-  if (findOperandDefinitionWithCondition(searchRoot->getResult(0),
-                                         isThisAxisExpandDims,
-                                         leavesSourceRegion))
+  if (findOperandDefinitionWithCondition(
+          searchRoot->getResult(0), isThisAxisExpandDims, leavesSourceRegion))
     return 1;
   return std::nullopt;
 }
@@ -727,10 +726,10 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
     auto mulI = dyn_cast<arith::MulIOp>(op);
     if (!mulI || isa<RankedTensorType>(mulI.getType()))
       return false;
-    bool rhsIsConst = static_cast<bool>(
-        mulI.getRhs().getDefiningOp<arith::ConstantOp>());
-    bool lhsIsConst = static_cast<bool>(
-        mulI.getLhs().getDefiningOp<arith::ConstantOp>());
+    bool rhsIsConst =
+        static_cast<bool>(mulI.getRhs().getDefiningOp<arith::ConstantOp>());
+    bool lhsIsConst =
+        static_cast<bool>(mulI.getLhs().getDefiningOp<arith::ConstantOp>());
     if (!rhsIsConst && !lhsIsConst)
       return false;
     Value carrier = rhsIsConst ? mulI.getLhs() : mulI.getRhs();
@@ -754,9 +753,10 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
 }
 
 // Matches a tt.load against the gather pattern and recovers its shape,
-// using ReadOnlyOffsetClassifier rather than the mutating OffsetAnalysis::parse.
-std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
-                                                       unsigned ubCapacityBytes) {
+// using ReadOnlyOffsetClassifier rather than the mutating
+// OffsetAnalysis::parse.
+std::optional<GatherCandidate>
+analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
   // Volatile accesses cannot be replaced by a different set of reads.
   if (loadOp.getIsVolatile() || !loadOp.getBoundaryCheck().empty())
     return std::nullopt;
@@ -783,7 +783,7 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
     return std::nullopt;
   if (offsetInfo.getRank() == 1) {
     LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] rank 1 is 'index "
-                              "select', handled elsewhere\n");
+                               "select', handled elsewhere\n");
     return std::nullopt;
   }
 
@@ -799,8 +799,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
   std::function<bool(Operation *)> stopStructured = [&](Operation *op) -> bool {
     return classifier.classify(op->getResult(0)).isStructured();
   };
-  Operation *indicesOp =
-      findPrecedingOpWithCondition(analyzedOp, isFullyUnstructured, stopStructured);
+  Operation *indicesOp = findPrecedingOpWithCondition(
+      analyzedOp, isFullyUnstructured, stopStructured);
   if (!indicesOp)
     return std::nullopt;
 
@@ -818,8 +818,9 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
       indicesType.getShape() != loadTensorType.getShape())
     return std::nullopt;
   if (candidate.indexRank > 5) {
-    LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] rank " << candidate.indexRank
-                           << " exceeds the supported maximum of 5\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "[GatherOptimization] rank " << candidate.indexRank
+               << " exceeds the supported maximum of 5\n");
     return std::nullopt;
   }
 
@@ -886,8 +887,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
     return std::nullopt;
   if (candidate.gatherAxis != candidate.indexRank - 1) {
     LLVM_DEBUG(llvm::dbgs() << "[GatherOptimization] detected gather axis "
-                           << candidate.gatherAxis
-                           << ", but only the last axis is in scope\n");
+                            << candidate.gatherAxis
+                            << ", but only the last axis is in scope\n");
     return std::nullopt;
   }
 
@@ -906,8 +907,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
     std::optional<int64_t> dim =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
     if (!dim && axis == 1) {
-      if (std::optional<ScalarAxisMatch> scalarMatch =
-              findScalarAxisDimension(srcAnalysisStart, indicesOp, classifier)) {
+      if (std::optional<ScalarAxisMatch> scalarMatch = findScalarAxisDimension(
+              srcAnalysisStart, indicesOp, classifier)) {
         dim = scalarMatch->dimension;
       }
     }
@@ -962,11 +963,11 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
       return std::nullopt;
   }
 
-  if (exceedsUbCapacity(candidate.srcShape, loadTensorType.getShape(),
-                       loadTensorType.getElementType(),
-                       cast<TensorType>(candidate.indices.getType())
-                           .getElementType(),
-                       ubCapacityBytes)) {
+  if (exceedsUbCapacity(
+          candidate.srcShape, loadTensorType.getShape(),
+          loadTensorType.getElementType(),
+          cast<TensorType>(candidate.indices.getType()).getElementType(),
+          ubCapacityBytes)) {
     LLVM_DEBUG(llvm::dbgs()
                << "[GatherOptimization] estimated UB usage exceeds budget\n");
     return std::nullopt;
@@ -995,7 +996,8 @@ std::optional<GatherCandidate> analyzeGatherCandidate(triton::LoadOp loadOp,
 
 // Used by revalidate(): a stale plan must match the same pattern it
 // originally found, not just any gather pattern on its anchor load.
-bool candidatesMatch(const GatherCandidate &stored, const GatherCandidate &fresh) {
+bool candidatesMatch(const GatherCandidate &stored,
+                     const GatherCandidate &fresh) {
   return stored.loadOp == fresh.loadOp && stored.addPtrOp == fresh.addPtrOp &&
          stored.indices == fresh.indices && stored.srcPtr == fresh.srcPtr &&
          stored.sourceBase == fresh.sourceBase &&
@@ -1025,9 +1027,8 @@ Value reduce(Value inputTensor, Location loc, IRRewriter &rewriter) {
     OpBuilder::InsertionGuard guard(rewriter);
     SmallVector<Type, 2> argTypes = {elementType, elementType};
     SmallVector<Location, 2> argLocs = {loc, loc};
-    Block *block = rewriter.createBlock(&reduceOp.getRegion(),
-                                        reduceOp.getRegion().end(), argTypes,
-                                        argLocs);
+    Block *block = rewriter.createBlock(
+        &reduceOp.getRegion(), reduceOp.getRegion().end(), argTypes, argLocs);
     auto mathOp = rewriter.create<TIOp>(loc, block->getArgument(0),
                                         block->getArgument(1));
     rewriter.create<triton::ReduceReturnOp>(loc, mathOp.getResult());
@@ -1042,8 +1043,9 @@ Value reduce(Value inputTensor, Location loc, IRRewriter &rewriter) {
 class GatherOptimizationPlan final : public RewritePlan {
 public:
   GatherOptimizationPlan(GatherCandidate candidate, unsigned epoch,
-                        unsigned ubCapacityBytes)
-      : loadOp(candidate.loadOp), loadOperation(candidate.loadOp.getOperation()),
+                         unsigned ubCapacityBytes)
+      : loadOp(candidate.loadOp),
+        loadOperation(candidate.loadOp.getOperation()),
         indicesElements(computeIndicesElements(candidate)),
         candidate(std::move(candidate)), epoch(epoch),
         ubCapacityBytes(ubCapacityBytes) {}
@@ -1055,7 +1057,8 @@ public:
   // Larger gathers are worth rewriting first.
   unsigned getBenefit() const override {
     constexpr int64_t maxBenefit = std::numeric_limits<unsigned>::max();
-    return static_cast<unsigned>(std::min<int64_t>(indicesElements, maxBenefit));
+    return static_cast<unsigned>(
+        std::min<int64_t>(indicesElements, maxBenefit));
   }
 
   Operation *getAnchor() const override { return loadOperation; }
@@ -1239,8 +1242,9 @@ private:
       OpBuilder elseBuilder = ifOp.getElseBodyBuilder(rewriter.getListener());
       IRMapping mapping;
       Operation *clonedLoad = elseBuilder.clone(*loadOp, mapping);
-      clonedLoad->setAttr(kGatherOptimisedLoadAttr,
-                          StringAttr::get(clonedLoad->getContext(), "fallback"));
+      clonedLoad->setAttr(
+          kGatherOptimisedLoadAttr,
+          StringAttr::get(clonedLoad->getContext(), "fallback"));
       elseBuilder.create<scf::YieldOp>(loc, clonedLoad->getResult(0));
     }
 

@@ -138,7 +138,8 @@ public:
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect>();
+    registry
+        .insert<arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() override;
