@@ -16,6 +16,9 @@
 // RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=3071 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
 // RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=68607 ub-capacity-bytes=157286' | FileCheck %s
 // RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
+// RUN: sed 's/^module attributes {/module attributes {hacc.independent_axis_tensorize,/' %s | triton-opt --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
+// RUN: sed 's/^module attributes {/module attributes {hacc.persistent_task_strip_mining,/' %s | triton-opt --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
+// RUN: sed 's/^module attributes {/module attributes {hacc.independent_axis_tensorize, hacc.persistent_task_strip_mining,/' %s | triton-opt --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
 // DISABLED-NOT: tt.gather
 // DISABLED-NOT: gather.optimised.load
 
@@ -23,7 +26,9 @@
 // The early Gather rewrite must remain valid through structured conversion.
 // The input has no full-row source read: the indirect load must still rewrite.
 // A looped, tensor-built (tt.expand_dims/tt.broadcast) gather.
-// A2/A3 default, template and explicit SIMD modes all permit the rule.
+// A2/A3 default, template and explicit SIMD modes permit unmapped IR.
+// Either successful IAT/PTSM module marker must preserve the indirect load,
+// even when the current pass enables only Gather; both markers also disable it.
 // Pure-SIMT is only a valid public compile mode on A5, which declines Gather.
 
 // CHECK: %[[OTHER:[^ ]+]] = arith.constant dense<-7.000000e+00> : tensor<2x16x128xf32>
