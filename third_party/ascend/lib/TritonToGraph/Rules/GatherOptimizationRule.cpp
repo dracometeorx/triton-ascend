@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
@@ -291,6 +292,10 @@ private:
 // scf.if), so findCandidates skips it.
 constexpr llvm::StringLiteral kGatherOptimisedLoadAttr =
     "gather.optimised.load";
+constexpr llvm::StringLiteral kIndependentAxisTensorizeMarkerAttr =
+    "hacc.independent_axis_tensorize";
+constexpr llvm::StringLiteral kPersistentTaskStripMiningMarkerAttr =
+    "hacc.persistent_task_strip_mining";
 
 struct GatherCandidate {
   triton::LoadOp loadOp;
@@ -757,6 +762,16 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
 // OffsetAnalysis::parse.
 std::optional<GatherCandidate>
 analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
+  // Mapping runs before Gather and records successful rewrites on the module.
+  // Gather's local UB estimate does not account for the combined backend
+  // allocation. Keep indirect loads after either mapping rewrite. Checking
+  // here also protects plan revalidation and application, not just discovery.
+  auto module = loadOp->getParentOfType<ModuleOp>();
+  if (module &&
+      (module->hasAttr(kIndependentAxisTensorizeMarkerAttr) ||
+       module->hasAttr(kPersistentTaskStripMiningMarkerAttr)))
+    return std::nullopt;
+
   // Volatile accesses cannot be replaced by a different set of reads.
   if (loadOp.getIsVolatile() || !loadOp.getBoundaryCheck().empty())
     return std::nullopt;

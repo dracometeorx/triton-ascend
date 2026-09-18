@@ -49,10 +49,11 @@ def indirect_rows_kernel(src_ptr, idx_ptr, out_ptr, n_rows, WIDTH: tl.constexpr,
         tl.store(out_ptr + positions, value)
 
 
-def make_indirect_ttir(rule_mask, *, per_lane=False, volatile=False, index_type="i32", value_type="fp32",
+def make_indirect_ttir(rule_mask=None, *, per_lane=False, volatile=False, index_type="i32", value_type="fp32",
                        compile_mode="simd", arch="Ascend910B1"):
     mode_options = {} if compile_mode is None else {"compile_mode": compile_mode}
-    options = NPUOptions(arch=arch, rule_mask=rule_mask, **mode_options)
+    rule_options = {} if rule_mask is None else {"rule_mask": rule_mask}
+    options = NPUOptions(arch=arch, **rule_options, **mode_options)
     source = ASTSource(
         indirect_rows_kernel,
         {"src_ptr": f"*{value_type}", "idx_ptr": f"*{index_type}", "out_ptr": f"*{value_type}", "n_rows": "i32"},
@@ -63,6 +64,45 @@ def make_indirect_ttir(rule_mask, *, per_lane=False, volatile=False, index_type=
     ascend_ir.load_dialects(context)
     module = ast_to_ttir(indirect_rows_kernel, source, context, options, {}, {})
     return make_ttir(module, {}, options)
+
+
+@triton.jit
+def mapping_gather_kernel(x_ptr, src_ptr, idx_ptr, out_ptr, H: tl.constexpr, K: tl.constexpr, W: tl.constexpr,
+                          R: tl.constexpr):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    cols = tl.arange(0, K)
+    # Separate axis strides remain analyzable across IAT -> PTSM.
+    x = tl.load(x_ptr + (token * (H * K) + head * K + cols))
+    normalized = x * tl.rsqrt(tl.sum(x * x, axis=0) / K + 1.0e-5)
+    rows = tl.arange(0, R)
+    indices = tl.load(idx_ptr + rows[:, None] * K + cols[None, :])
+    offsets = rows[:, None] * W + indices
+    selected = tl.load(src_ptr + offsets)
+    out_offsets = token * (H * R * K) + head * (R * K) + rows[:, None] * K + cols[None, :]
+    tl.store(out_ptr + out_offsets, normalized[None, :] + selected)
+
+
+@pytest.mark.parametrize("rule_mask,mapping,gather", [(None, True, False), (3071, True, False), (66047, False, True)],
+                         ids=["default", "gather-off", "mapping-off"])
+def test_gather_skips_program_mapping(tmp_path, rule_mask, mapping, gather):
+    options = NPUOptions(arch="Ascend910B1", sanitize_overflow=False,
+                         **({} if rule_mask is None else {"rule_mask": rule_mask}))
+    source = ASTSource(mapping_gather_kernel,
+                       {"x_ptr": "*fp32", "src_ptr": "*fp32", "idx_ptr": "*i32", "out_ptr": "*fp32"},
+                       {"H": 17, "K": 32, "W": 8192, "R": 2})
+    context = ir.context()
+    ir.load_dialects(context)
+    ascend_ir.load_dialects(context)
+    module = ast_to_ttir(mapping_gather_kernel, source, context, options, {}, {})
+    text = str(make_ttir(module, {}, options))
+    assert ("hacc.independent_axis_tensorize" in text) == mapping
+    assert ("hacc.persistent_task_strip_mining" in text) == mapping
+    assert ("tt.gather" in text) == gather
+    assert ("gather.optimised.load" in text) == gather
+    path = tmp_path / "mapping-gather.ttir.mlir"
+    path.write_text(text)
+    ir.parse_mlir_module(str(path), context)
 
 
 def gather_fixture():
@@ -91,6 +131,7 @@ def run_gather_pass(tmp_path, text, **options):
 
 
 @pytest.mark.parametrize("rule_mask,per_lane,volatile,index_type,expected", [
+    (None, False, False, "i32", True),  # Omit rule_mask: production default.
     (0, False, False, "i32", False),
     (3071, False, False, "i32", False),
     (512, False, False, "i32", False),  # IAT owns bit 512 on main-dev.
@@ -129,10 +170,10 @@ def test_gather_rule_in_make_ttir(tmp_path, rule_mask, per_lane, volatile, index
 
 
 def test_gather_rule_mask_changes_cache_key():
-    assert NPUOptions(rule_mask=3071).hash() != NPUOptions(rule_mask=68607).hash()
+    assert NPUOptions(rule_mask=3071).hash() != NPUOptions().hash()
 
 
-@pytest.mark.parametrize("rule_mask", [3071, 65536, 68607])
+@pytest.mark.parametrize("rule_mask", [3071, 65536, None])
 @pytest.mark.parametrize("arch,compile_mode", [
     ("Ascend910B1", None),
     ("Ascend910B1", "simd"),
@@ -152,7 +193,7 @@ def test_gather_rule_mask_changes_cache_key():
 ])
 def test_gather_rule_target_and_mode(rule_mask, arch, compile_mode):
     text = str(make_indirect_ttir(rule_mask, arch=arch, compile_mode=compile_mode))
-    expected = bool(rule_mask & 65536) and arch in ("Ascend910B1", "Ascend910_9391")
+    expected = (rule_mask is None or bool(rule_mask & 65536)) and arch in ("Ascend910B1", "Ascend910_9391")
     assert ("tt.gather" in text) == expected
     assert ("gather.optimised.load" in text) == expected
 
@@ -286,7 +327,9 @@ def test_gather_rule_npu_semantics(monkeypatch, dtype, case):
     arch = triton.runtime.driver.active.get_current_target().arch
     gather_target = arch.startswith(("Ascend910B", "Ascend910_93"))
     outputs = []
-    for rule_mask in (3071, 68607):
+    # Exercise the public default-on / explicit-off launch contract.
+    for gather_enabled in (False, True):
+        rule_options = {} if gather_enabled else {"rule_mask": 3071}
         indirect_rows_kernel.device_caches.clear()
         output = torch.empty((row_blk, k), dtype=getattr(torch, dtype), device="npu")
         compiled = indirect_rows_kernel[(1, )](
@@ -301,10 +344,10 @@ def test_gather_rule_npu_semantics(monkeypatch, dtype, case):
             PER_LANE=case == "per_lane",
             VOLATILE=case == "volatile",
             BASE_ROW=base_row,
-            rule_mask=rule_mask,
+            **rule_options,
         )
         torch.npu.synchronize()
-        expected_rewrite = gather_target and rule_mask == 68607 and case not in ("per_lane", "volatile", "i64")
+        expected_rewrite = gather_target and gather_enabled and case not in ("per_lane", "volatile", "i64")
         assert ("tt.gather" in compiled.asm["ttir"]) == expected_rewrite
         outputs.append(output.cpu())
         expected_output = gather_reference if expected_rewrite else reference
@@ -336,14 +379,16 @@ def test_gather_rule_npu_full_row_offset_view(monkeypatch, compile_mode):
     arch = triton.runtime.driver.active.get_current_target().arch
     gather_target = arch.startswith(("Ascend910B", "Ascend910_93"))
     mode_options = {} if compile_mode is None else {"compile_mode": compile_mode}
-    for rule_mask in (3071, 68607):
+    # Exercise the public default-on / explicit-off launch contract.
+    for gather_enabled in (False, True):
+        rule_options = {} if gather_enabled else {"rule_mask": 3071}
         indirect_rows_kernel.device_caches.clear()
         output = torch.empty((2, 8), dtype=torch.float32, device="npu")
         compiled = indirect_rows_kernel[(1, )](source, indices, output, 2, WIDTH=16, K=8, ROW_BLK=2, ROW_STEP=2,
-                                               PER_LANE=False, VOLATILE=False, BASE_ROW=0, rule_mask=rule_mask,
+                                               PER_LANE=False, VOLATILE=False, BASE_ROW=0, **rule_options,
                                                **mode_options)
         torch.npu.synchronize()
-        expected_rewrite = gather_target and rule_mask == 68607
+        expected_rewrite = gather_target and gather_enabled
         assert ("tt.gather" in compiled.asm["ttir"]) == expected_rewrite
         assert ("gather.optimised.load" in compiled.asm["ttir"]) == expected_rewrite
         torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
@@ -399,11 +444,12 @@ def test_gather_rule_npu_negative_debug(tmp_path, monkeypatch):
         log("debug overrides: TRITON_ALWAYS_COMPILE=1; kernel JIT cache cleared")
         width, k, n_rows, row_blk, row_step, base_row = 16, 8, 3, 4, 2, 2
         dtype = torch.float32
-        masks = (3071, 65536, 68607)
+        variants = {"disabled": {"rule_mask": 3071}, "default": {}}
         options = dict(WIDTH=width, K=k, ROW_BLK=row_blk, ROW_STEP=row_step, PER_LANE=False, VOLATILE=False,
                        BASE_ROW=base_row, compile_mode="simd")
-        log(f"source_dtype={dtype}; index_dtype=int32; grid=(1,); n_rows={n_rows}; options={options}; masks={masks}")
-        log("3071=raw-load baseline; 65536=Gather rule selected; 68607=default rules including Gather")
+        log(f"source_dtype={dtype}; index_dtype=int32; grid=(1,); n_rows={n_rows}; options={options}; variants={variants}"
+            )
+        log("disabled: rule_mask=3071 (raw-load baseline); default: rule_mask omitted (Gather enabled)")
         log("auto_hit below denotes a compiled rewrite; expected_branch is inferred from the CPU input bounds")
 
         # Two prefix rows protect the baseline's -W-1 access; a suffix row also
@@ -443,25 +489,25 @@ def test_gather_rule_npu_negative_debug(tmp_path, monkeypatch):
         # warmup compiles without launching. Persist every textual IR stage now,
         # so a later launch/synchronization failure does not lose compiler output.
         compiled_ir = {}
-        for rule_mask in masks:
-            stage = f"compile without launch: mask={rule_mask}"
+        for variant, rule_options in variants.items():
+            stage = f"compile without launch: variant={variant}"
             log(f"START {stage}")
             compiled = indirect_rows_kernel.warmup(source_npu, indices_npu, output_npu, n_rows, grid=(1, ),
-                                                   rule_mask=rule_mask, **options)
-            log(f"compiled mask={rule_mask}; metadata={compiled.metadata}; asm_keys={list(compiled.asm)}")
+                                                   **rule_options, **options)
+            log(f"compiled variant={variant}; metadata={compiled.metadata}; asm_keys={list(compiled.asm)}")
             for key, value in compiled.asm.items():
                 if isinstance(value, str):
                     name = re.sub(r"[^a-zA-Z0-9_.-]", "_", key)
-                    path = artifacts / f"mask-{rule_mask}.{name}"
+                    path = artifacts / f"{variant}.{name}"
                     path.write_text(value)
                     log(f"saved {path}")
             ttir = compiled.asm["ttir"]
-            compiled_ir[rule_mask] = ttir
+            compiled_ir[variant] = ttir
             gather = "tt.gather" in ttir
             source_marker = 'gather.optimised.load = "source"' in ttir
             fallback_marker = 'gather.optimised.load = "fallback"' in ttir
             normalization = "arith.shrsi" in ttir
-            log(f"mask={rule_mask}: gather={gather}, source_marker={source_marker}, fallback_marker={fallback_marker}, negative_normalization={normalization}"
+            log(f"variant={variant}: gather={gather}, source_marker={source_marker}, fallback_marker={fallback_marker}, negative_normalization={normalization}"
                 )
             lines = ttir.splitlines()
             selected = set()
@@ -470,11 +516,11 @@ def test_gather_rule_npu_negative_debug(tmp_path, monkeypatch):
                        for token in ("tt.gather", "gather.optimised.load", "arith.shrsi", "arith.cmpi", "scf.if")):
                     selected.update(range(max(0, line - 2), min(len(lines), line + 3)))
             log("TTIR excerpts:\n" + "\n".join(f"{line + 1}: {lines[line]}" for line in sorted(selected)))
-            if rule_mask == 3071:
+            if variant == "disabled":
                 assert not any((gather, source_marker, fallback_marker)), "Baseline unexpectedly rewrote"
             else:
                 assert all((gather, source_marker, fallback_marker, normalization)), (
-                    f"mask={rule_mask}: expected negative-index Gather rewrite; inspect saved TTIR and installed compiler"
+                    f"variant={variant}: expected negative-index Gather rewrite; inspect saved TTIR and installed compiler"
                 )
 
         for case, indices in cases.items():
@@ -508,8 +554,8 @@ def test_gather_rule_npu_negative_debug(tmp_path, monkeypatch):
                             log(f"row={row}: Gather physical addresses={addresses.tolist()}")
                             expected[row] = source[addresses]
             log(f"raw-load physical addresses={raw_addresses.tolist()}")
-            log(f"expected mask=3071 (raw offsets)={raw.tolist()}")
-            log(f"expected masks=65536/68607 (tile-wise wrap/fallback)={expected.tolist()}")
+            log(f"expected disabled (raw offsets)={raw.tolist()}")
+            log(f"expected default (tile-wise wrap/fallback)={expected.tolist()}")
             if case != "positive_control":
                 assert not torch.equal(raw, expected), "Diagnostic data must distinguish wrapping from raw offsets"
             record = dict(case=case, indices=indices.tolist(), branches=branches, raw_addresses=raw_addresses.tolist(),
@@ -520,26 +566,26 @@ def test_gather_rule_npu_negative_debug(tmp_path, monkeypatch):
             log(f"START {stage}")
             indices_npu.copy_(indices)
             torch.npu.synchronize()
-            for rule_mask in masks:
-                stage = f"poison output and synchronize: {case}, mask={rule_mask}"
+            for variant, rule_options in variants.items():
+                stage = f"poison output and synchronize: {case}, variant={variant}"
                 log(f"START {stage}")
                 output_npu.fill_(float("nan"))
                 torch.npu.synchronize()
-                stage = f"kernel launch: {case}, mask={rule_mask}"
+                stage = f"kernel launch: {case}, variant={variant}"
                 log(f"START {stage}")
-                launched = indirect_rows_kernel[(1, )](source_npu, indices_npu, output_npu, n_rows, rule_mask=rule_mask,
+                launched = indirect_rows_kernel[(1, )](source_npu, indices_npu, output_npu, n_rows, **rule_options,
                                                        **options)
-                stage = f"post-kernel synchronize: {case}, mask={rule_mask}"
+                stage = f"post-kernel synchronize: {case}, variant={variant}"
                 log(f"START {stage}")
                 torch.npu.synchronize()
-                stage = f"copy output to CPU and compare: {case}, mask={rule_mask}"
+                stage = f"copy output to CPU and compare: {case}, variant={variant}"
                 log(f"START {stage}")
                 actual = output_npu.cpu()
                 log(f"actual={actual.tolist()}")
-                record["actual"][str(rule_mask)] = actual.tolist()
+                record["actual"][variant] = actual.tolist()
                 result_path.write_text(json.dumps(record, indent=2) + "\n")
-                assert launched.asm["ttir"] == compiled_ir[rule_mask], "Launch differs from saved compilation"
-                reference = raw if rule_mask == 3071 else expected
+                assert launched.asm["ttir"] == compiled_ir[variant], "Launch differs from saved compilation"
+                reference = raw if variant == "disabled" else expected
                 bad = (actual != reference).nonzero().tolist()
                 log(f"mismatches={len(bad)}; max_abs_error={float((actual - reference).abs().max())}")
                 for row, col in bad:
@@ -547,8 +593,8 @@ def test_gather_rule_npu_negative_debug(tmp_path, monkeypatch):
                     log(f"mismatch [{row}, {col}]: index={index}, actual={float(actual[row, col])}, expected={float(reference[row, col])}"
                         )
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-                log(f"PASS case={case}, mask={rule_mask}")
-        log(f"PASS all five inputs and three rule masks; artifacts={artifacts}")
+                log(f"PASS case={case}, variant={variant}")
+        log(f"PASS all five inputs with Gather disabled and default options; artifacts={artifacts}")
     except Exception:
         # Do not issue further NPU calls after an asynchronous device failure.
         log(f"FAILED during {stage}; artifacts={artifacts}\n{traceback.format_exc()}")
