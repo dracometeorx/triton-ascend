@@ -767,9 +767,8 @@ analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
   // allocation. Keep indirect loads after either mapping rewrite. Checking
   // here also protects plan revalidation and application, not just discovery.
   auto module = loadOp->getParentOfType<ModuleOp>();
-  if (module &&
-      (module->hasAttr(kIndependentAxisTensorizeMarkerAttr) ||
-       module->hasAttr(kPersistentTaskStripMiningMarkerAttr)))
+  if (module && (module->hasAttr(kIndependentAxisTensorizeMarkerAttr) ||
+                 module->hasAttr(kPersistentTaskStripMiningMarkerAttr)))
     return std::nullopt;
 
   // Volatile accesses cannot be replaced by a different set of reads.
