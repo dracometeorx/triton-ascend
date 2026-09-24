@@ -27,7 +27,6 @@
 #include "ascend/include/TritonToLinalg/LoadStoreConverter.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToStructured/MemOpConverter.h"
-#include "ascend/include/TritonToUnstructure/OffsetAnalysis.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Attributes.h"
@@ -627,24 +626,6 @@ struct DiscreteMaskAtomicConversion
     : OpRewritePattern<mlir::triton::AtomicRMWOp> {
   using OpRewritePattern<mlir::triton::AtomicRMWOp>::OpRewritePattern;
 
-  // OffsetAnalysis verdicts per pointer, cached for one
-  // applyPatternsGreedily run: the greedy driver re-matches ops many times,
-  // and the def-chain behind a pointer does not change underneath it. The
-  // map dies with this pattern, so it never outlives the module's IR.
-  mutable llvm::DenseMap<Value, PtrOffsetInfo> offsetMap;
-
-  bool isStructuredPointer(Value ptr, Location loc,
-                           PatternRewriter &rewriter) const {
-    auto it = offsetMap.find(ptr);
-    if (it != offsetMap.end()) {
-      return it->second.isStructured();
-    }
-
-    triton::parse(ptr, loc, rewriter, offsetMap);
-    it = offsetMap.find(ptr);
-    return it != offsetMap.end() && it->second.isStructured();
-  }
-
   LogicalResult matchAndRewrite(mlir::triton::AtomicRMWOp op,
                                 PatternRewriter &rewriter) const final {
     auto loc = op.getLoc();
@@ -656,14 +637,10 @@ struct DiscreteMaskAtomicConversion
     if (failed(isDiscreteMask(op, mask, rewriter)))
       return failure();
 
-    // Keep the original mask for the SIMT atomic template when the pointer
-    // needs the indirect atomic ABI. The unstructure pass flattens it together
-    // with offsets and values; replacing it with a select here would lose that
-    // lane mask. Structured pointers do not need the indirect ABI, so fall
-    // through to the SIMD select+atomic rewrite below instead.
+    // The template atomic ABI consumes the original lane mask.  Do not turn it
+    // into a select before TritonToUnstructure has the chance to preserve it.
     if (compileOn91095Flag &&
-        triton::ascend::isSimtTemplateMode(compileModeFlag) &&
-        !isStructuredPointer(ptr, loc, rewriter)) {
+        triton::ascend::isSimtTemplateMode(compileModeFlag)) {
       op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
                   rewriter.getUnitAttr());
       return failure();
