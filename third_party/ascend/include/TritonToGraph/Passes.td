@@ -90,7 +90,7 @@ def GraphOptimize : Pass<"graph-optimize", "mlir::ModuleOp"> {
     Option<"targetArch", "target-arch", "std::string", "\"\"",
            "Target architecture for Gather eligibility; unsupported targets disable Gather">,
     Option<"compileMode", "compile-mode", "std::string", "\"simd_simt_template\"",
-           "Compilation mode; RowCoalescing is enabled only for simt_only">,
+           "Compilation mode; legacy elementwise RowCoalescing is enabled only for simt_only">,
   ];
 }
 

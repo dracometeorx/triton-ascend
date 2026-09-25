@@ -249,7 +249,7 @@ def _finalize_program_launch_policy(metadata, opt):
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
     rc = _get_then_remove_rc(mod, "triton_ascend.dynamic_cv_pipeline.rc")
-    if rc == 4:
+    if rc == 3:
         metadata["disable_vf_operand_substitution"] = True
         return
     if rc != -1 and rc > 0:
@@ -394,7 +394,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
-            ascend.passes.ttir.set_enable_cube_block_merge(metadata["enable_cube_block_merge"])
 
             # Must run before add_dynamic_cv_pipeline because the driven
             # AddMultiBufferInnerScope pass reads the module-level
@@ -640,21 +639,6 @@ def get_common_bishengir_compile_options(metadata):
     return [bishengir_target_opt]
 
 
-def _needs_lib_call_no_inline(metadata):
-    arch = metadata['target'].arch
-    return arch.startswith("Ascend950")
-
-
-@functools.lru_cache()
-def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
-    try:
-        result = subprocess.run([compiler_path, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return option in result.stdout
-
-
 def get_auto_bind_sub_block_option(metadata):
     # auto_tile_and_bind_subblock is read from the module.
     # enable_auto_bind_sub_block is set by the user and has a higher priority.
@@ -675,6 +659,12 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
 
     dump_manager = get_dump_manager(metadata_hash)
     dump_manager.put(Path(output_path).read_text(encoding='utf-8'), "kernel.npuir.mlir", binary=False)
+
+
+def _dump_kernel_binary(metadata_hash: str, bin_path: str):
+    """Copy the compiled kernel object into the TRITON_DEBUG dump directory."""
+    dump_manager = get_dump_manager(metadata_hash)
+    dump_manager.put(Path(bin_path).read_bytes(), os.path.basename(bin_path), binary=True)
 
 
 def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: dict, opt) -> Tuple[bool, str]:
@@ -868,9 +858,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
             # Temporary until the NPU compiler enables batch matmul by default in Q4.
             if metadata.get("enable_hivm_batch_matmul"):
                 _compile_option_list += ["--enable-hivm-batch-matmul"]
@@ -881,8 +868,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
         _compile_option_list += ["--mlir-print-ir-after-failure"]
         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
-        if opt.debug:
-            _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None:
@@ -902,7 +887,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
-            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
@@ -926,6 +911,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+
+        if opt.debug:
+            _dump_kernel_binary(metadata["hash"], bin_path)
 
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
@@ -1093,20 +1081,15 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 bishengir_hivm_opt,
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
 
         _compile_option_list += ["--mlir-print-ir-after-failure"]
         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
-        if opt.debug:
-            _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
-            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
@@ -1129,6 +1112,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+
+        if opt.debug:
+            _dump_kernel_binary(metadata["hash"], bin_path)
 
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
@@ -1630,4 +1616,6 @@ class AscendBackend(BaseBackend):
         return str(version_key)
 
     def get_module_map(self) -> Dict[str, ModuleType]:
-        return {}
+        from triton.language.extra.cann import libdevice
+
+        return {"triton.language.extra.libdevice": libdevice}

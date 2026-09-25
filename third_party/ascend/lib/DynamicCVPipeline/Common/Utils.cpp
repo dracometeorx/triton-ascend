@@ -41,12 +41,7 @@ static constexpr const char *DEBUG_TYPE = "dynamic-cv-pipeline-utils";
 namespace mlir {
 namespace CVPipeline {
 
-static bool g_enableCubeBlockMerge = false;
 static bool g_enableUBRefineOpt = false;
-
-void setEnableCubeBlockMerge(bool enable) { g_enableCubeBlockMerge = enable; }
-
-bool isCubeBlockMergeEnabled() { return g_enableCubeBlockMerge; }
 
 CoreType getOpCoreType(Operation *op) {
   if (!op) {
@@ -224,10 +219,9 @@ CoreType getCoreTypeOfSimpleOpOrCf(Operation *op) {
   }
   auto funcOp = op->getParentOfType<func::FuncOp>();
   if (funcOp) {
-    constexpr llvm::StringLiteral regionalDisabledOps[4]{
+    constexpr llvm::StringLiteral regionalDisabledOps[2]{
         "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64",
-        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
-        "chunk_ttt_linear_fwd_kernel_h", "chunk_ttt_linear_bwd_kernel_h"};
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"};
     if (llvm::is_contained(regionalDisabledOps, funcOp.getSymName())) {
       return CoreType::UNDETERMINED;
     }

@@ -88,8 +88,8 @@ inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
 inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
 inline constexpr llvm::StringLiteral kSubBlock = "ssbuffer.subBlock";
-inline constexpr llvm::StringLiteral kSkipExtraReorder =
-    "ssbuffer.skip_extra_reorder";
+inline constexpr llvm::StringLiteral kMergeComputeBlockApplied =
+    "ssbuffer.merge_compute_block_applied";
 inline constexpr llvm::StringLiteral kMergeSmallBlockFirstRunDone =
     "ssbuffer.merge_small_block_first_run_done";
 
@@ -98,7 +98,6 @@ inline constexpr const char *ERRCODE_ATTR =
 static constexpr const int ERRCODE_FAILED = 1;
 static constexpr const int ERRCODE_IGNORED = 2;
 static constexpr const int ERRCODE_TUPLE_PRELOAD_FAILED = 3;
-static constexpr const int ERRCODE_DISABLE_VF_SUBSTITUTION = 4;
 constexpr int64_t CACHE_TABLE_BUFFER_SIZE = 4096;
 constexpr int64_t BYTE_SIZE = 8;
 static constexpr int crossCoreProducerId = 1;
@@ -121,9 +120,6 @@ inline constexpr CoreType fromStrCoreType(std::string_view s) {
 
   return CoreType::UNDETERMINED;
 }
-
-void setEnableCubeBlockMerge(bool enable);
-bool isCubeBlockMergeEnabled();
 
 void setEnableUBRefineOpt(bool enable);
 bool isUBRefineOptEnabled();

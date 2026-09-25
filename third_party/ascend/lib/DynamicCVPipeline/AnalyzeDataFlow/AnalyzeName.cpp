@@ -42,13 +42,9 @@ namespace {
 
 static constexpr llvm::StringLiteral interceptrFunc[]{
     "kernel_sdpa_bwd_kv",
-    "flash_varlen_fwd_kernel",
     "_sparse_decode_kernel",
     "_sparse_decode_model1_kernel",
     "sparse_flash_attention_grad_kernel",
-    "flex_attention_backward_dkdv_kernel",
-    "flex_attention_backward_dkdv_kernel_tasklist",
-    "chunkwise_bwd_kernel_dhg",
 };
 
 static LogicalResult verifyFuncNames(ModuleOp module) {
