@@ -419,8 +419,12 @@ constexpr uint64_t kIndexFootprintAtIndexElemMultiplier = 4;
 bool exceedsUbCapacity(ArrayRef<int64_t> srcShape,
                        ArrayRef<int64_t> indicesShape, Type loadElementType,
                        Type indexElementType, unsigned ubCapacityBytes) {
+  // The rule is not registered with a zero budget, so this only guards a rule
+  // constructed directly. Keep it failing closed anyway: a zero budget is an
+  // unknown UB capacity rather than an unlimited one, and the
+  // unknown-element-size path below already rejects rather than risks.
   if (ubCapacityBytes == 0)
-    return false;
+    return true;
   std::optional<uint64_t> loadElemBytes = getByteWidth(loadElementType);
   std::optional<uint64_t> indexElemBytes = getByteWidth(indexElementType);
   if (!loadElemBytes || !indexElemBytes)

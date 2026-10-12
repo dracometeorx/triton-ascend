@@ -16,6 +16,8 @@
 // RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=3071 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
 // RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=68607 ub-capacity-bytes=157286' | FileCheck %s
 // RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=512 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
+// An absent UB budget is unknown, not unlimited, so Gather must fail closed.
+// RUN: triton-opt %s --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536' | FileCheck %s --check-prefix=DISABLED
 // RUN: sed 's/^module attributes {/module attributes {hacc.independent_axis_tensorize,/' %s | triton-opt --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
 // RUN: sed 's/^module attributes {/module attributes {hacc.persistent_task_strip_mining,/' %s | triton-opt --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED
 // RUN: sed 's/^module attributes {/module attributes {hacc.independent_axis_tensorize, hacc.persistent_task_strip_mining,/' %s | triton-opt --verify-each -graph-optimize='target-arch=Ascend910B1 rule-mask=65536 ub-capacity-bytes=157286' | FileCheck %s --check-prefix=DISABLED

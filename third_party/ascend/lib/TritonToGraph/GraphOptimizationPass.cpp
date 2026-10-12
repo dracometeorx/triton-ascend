@@ -565,7 +565,11 @@ void populateBuiltinGraphOptimizationRules(
   llvm::StringRef target = options.targetArch;
   bool gatherTarget =
       target.starts_with("Ascend910B") || target.starts_with("Ascend910_93");
-  if (gatherTarget &&
+  // A zero budget is an unknown UB capacity, not an unlimited one:
+  // ub_size_in_kbytes_for_arch returns 0 for unknown and empty targets. Gather
+  // sizes a whole source tile per candidate, so without a budget it cannot
+  // bound what it builds. Do not register the rule at all in that case.
+  if (gatherTarget && options.ubCapacityBytes != 0 &&
       isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::GatherOptimization)) {
     rules.push_back(createGatherOptimizationRule(options.ubCapacityBytes));
