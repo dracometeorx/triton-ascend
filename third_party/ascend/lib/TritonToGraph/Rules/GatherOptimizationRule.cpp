@@ -1057,12 +1057,29 @@ public:
   }
 
   LogicalResult apply(IRRewriter &rewriter) override {
+    RewritePlanApplyResult result = applyWithResult(rewriter);
+    if (result == RewritePlanApplyResult::NotApplicable) {
+      // The generic rewrite loop treats any apply() failure as fatal, so a
+      // decline must not surface as failure here. The IR is already back to
+      // the original load, so record the decline on that load instead:
+      // revalidate() and findCandidates() both skip marked loads, which keeps
+      // the declined candidate from being rediscovered and re-declined on
+      // every iteration. Only this rule reads the marker, so no other
+      // optimization observes it.
+      loadOp->setAttr(kGatherOptimisedLoadAttr,
+                      StringAttr::get(loadOp->getContext(), "no match"));
+      return success();
+    }
+    return success(result == RewritePlanApplyResult::Applied);
+  }
+
+  RewritePlanApplyResult applyWithResult(IRRewriter &rewriter) override {
     // Re-derive before mutating, like revalidate(): a stale plan must never
     // be able to mutate the IR.
     std::optional<GatherCandidate> fresh =
         analyzeGatherCandidate(loadOp, ubCapacityBytes);
     if (!fresh || !candidatesMatch(candidate, *fresh))
-      return failure();
+      return RewritePlanApplyResult::NotApplicable;
     return buildGatherRewrite(*fresh, rewriter);
   }
 
@@ -1077,8 +1094,8 @@ private:
     return elements;
   }
 
-  static LogicalResult buildGatherRewrite(const GatherCandidate &candidate,
-                                          IRRewriter &rewriter) {
+  static RewritePlanApplyResult
+  buildGatherRewrite(const GatherCandidate &candidate, IRRewriter &rewriter) {
     triton::LoadOp loadOp = candidate.loadOp;
     auto loadTensorType = cast<TensorType>(loadOp.getType());
     auto indicesTensorType = cast<TensorType>(candidate.indices.getType());
@@ -1093,7 +1110,7 @@ private:
     // before either creates anything, rather than relying on them failing
     // identically (true today only because they share the same input).
     if (!isa<RankedTensorType>(ourIndices.getType()))
-      return failure();
+      return RewritePlanApplyResult::NotApplicable;
 
     Location loc = loadOp.getLoc();
     rewriter.setInsertionPoint(loadOp);
@@ -1119,7 +1136,9 @@ private:
     auto minIndex = reduce<arith::MinSIOp>(ourIndices, loc, rewriter);
     auto maxIndex = reduce<arith::MaxSIOp>(ourIndices, loc, rewriter);
     if (!minIndex || !maxIndex)
-      return failure();
+      // The precondition above already guarantees a ranked tensor, so this is
+      // an internal inconsistency rather than an unsupported candidate.
+      return RewritePlanApplyResult::Failed;
 
     // Match the v2 / PR #1027 indexing contract: indices in [-width, width)
     // use row-local wraparound in the Gather branch. This intentionally differs
@@ -1232,10 +1251,13 @@ private:
     for (Operation *created = first; created != loadOp.getOperation();
          created = created->getNextNode())
       if (failed(mlir::verify(created)))
-        return failure();
+        // As in RowCoalescing, IR that does not verify means this candidate
+        // turned out to be unsupported, not that the pass should fail: the
+        // scope_exit above has already restored the original load.
+        return RewritePlanApplyResult::NotApplicable;
     rollback.release();
     rewriter.replaceOp(loadOp, ifOp.getResult(0));
-    return success();
+    return RewritePlanApplyResult::Applied;
   }
 
   triton::LoadOp loadOp;
