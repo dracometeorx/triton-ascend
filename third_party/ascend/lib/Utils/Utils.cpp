@@ -997,9 +997,14 @@ mlir::Operation *findOperandDefinitionWithCondition(
   } else if (auto op = dyn_cast<LoopLikeOpInterface>(rootOp)) {
     auto resNum = cast<OpResult>(operand).getResultNumber();
     Value yieldedValue = nullptr;
+    // A loop-like op need not expose one yielded value per result: scf.forall
+    // and scf.parallel yield none at all, so indexing by result number would
+    // run past the end. Leaving yieldedValue null is what the comment above
+    // already promises for that case.
     if (auto whileOp = dyn_cast<scf::WhileOp>(op.getOperation())) {
-      yieldedValue = whileOp.getConditionOp().getArgs()[resNum];
-    } else {
+      if (resNum < whileOp.getConditionOp().getArgs().size())
+        yieldedValue = whileOp.getConditionOp().getArgs()[resNum];
+    } else if (resNum < op.getYieldedValues().size()) {
       yieldedValue = op.getYieldedValues()[resNum];
     }
     if (yieldedValue) {
@@ -1176,7 +1181,15 @@ findPrecedingOpWithCondition(mlir::Operation *rootOp,
   } else if (isa<scf::IfOp>(rootOp)) {
   } else if (isa<LoopLikeOpInterface>(rootOp)) {
   } else {
-    rootOp->emitRemark("Backtracing encounters unsupported Operation");
+    // Hitting an unmodeled op is an ordinary negative result during candidate
+    // discovery, not something to report on the module: the only caller probes
+    // every load repeatedly, so a remark here fires many times per load and
+    // per rewrite iteration for IR that merely is not a gather.
+    LLVM_DEBUG({
+      auto &os = llvm::dbgs();
+      os << "[findPrecedingOpWithCondition] unsupported Operation: { "
+         << *rootOp << " }\n";
+    });
     return nullptr;
   }
 
