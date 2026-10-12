@@ -333,3 +333,100 @@ tt.func @runtime_row_stride(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %stride: i32
   %value = tt.load %ptrs : tensor<2x16x!tt.ptr<f32>>
   tt.return %value : tensor<2x16xf32>
 }
+
+// -----
+
+// The scalar-row path has no tt.expand_dims tying its constant to the axis it
+// sizes, so the multiplicand has to carry that evidence instead: a provable
+// per-row advance. A row offset loaded from memory proves nothing, so the
+// constant beside it need not be the row stride at all.
+// CHECK-LABEL: @scalar_row_loaded_carrier
+// CHECK-NOT: tt.gather
+// CHECK: tt.return
+tt.func @scalar_row_loaded_carrier(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>,
+                                   %off: !tt.ptr<i32>, %out: !tt.ptr<f32>) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %c64_i32 = arith.constant 64 : i32
+  %c16_i32 = arith.constant 16 : i32
+  %cols = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32>
+  %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<8xi32> -> tensor<1x8xi32>
+  %idx_base = tt.splat %idx : !tt.ptr<i32> -> tensor<1x8x!tt.ptr<i32>>
+  %src_base = tt.splat %src : !tt.ptr<f32> -> tensor<1x8x!tt.ptr<f32>>
+  %out_base = tt.splat %out : !tt.ptr<f32> -> tensor<1x8x!tt.ptr<f32>>
+  scf.for %i = %c0_i32 to %c64_i32 step %c1_i32 : i32 {
+    %off_ptr = tt.addptr %off, %i : !tt.ptr<i32>, i32
+    %row = tt.load %off_ptr : !tt.ptr<i32>
+    %row_base = arith.muli %row, %c16_i32 : i32
+    %idx_ptrs = tt.addptr %idx_base, %cols_2d : tensor<1x8x!tt.ptr<i32>>, tensor<1x8xi32>
+    %indices = tt.load %idx_ptrs : tensor<1x8x!tt.ptr<i32>>
+    %row_splat = tt.splat %row_base : i32 -> tensor<1x8xi32>
+    %offsets = arith.addi %row_splat, %indices : tensor<1x8xi32>
+    %ptrs = tt.addptr %src_base, %offsets : tensor<1x8x!tt.ptr<f32>>, tensor<1x8xi32>
+    %value = tt.load %ptrs : tensor<1x8x!tt.ptr<f32>>
+    %out_ptrs = tt.addptr %out_base, %cols_2d : tensor<1x8x!tt.ptr<f32>>, tensor<1x8xi32>
+    tt.store %out_ptrs, %value : tensor<1x8x!tt.ptr<f32>>
+  }
+  tt.return
+}
+
+// -----
+
+// Two row-driven multiplies in one source offset: the offset advances by
+// 1024 + 16 per iteration, so neither constant is the row stride and a
+// 1024-wide read would cross into the next row's data.
+// CHECK-LABEL: @scalar_row_two_strides
+// CHECK-NOT: tt.gather
+// CHECK: tt.return
+tt.func @scalar_row_two_strides(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>,
+                                %out: !tt.ptr<f32>) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %c64_i32 = arith.constant 64 : i32
+  %c16_i32 = arith.constant 16 : i32
+  %c1024_i32 = arith.constant 1024 : i32
+  %cols = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32>
+  %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<8xi32> -> tensor<1x8xi32>
+  %idx_base = tt.splat %idx : !tt.ptr<i32> -> tensor<1x8x!tt.ptr<i32>>
+  %src_base = tt.splat %src : !tt.ptr<f32> -> tensor<1x8x!tt.ptr<f32>>
+  %out_base = tt.splat %out : !tt.ptr<f32> -> tensor<1x8x!tt.ptr<f32>>
+  scf.for %i = %c0_i32 to %c64_i32 step %c1_i32 : i32 {
+    %major = arith.muli %i, %c1024_i32 : i32
+    %minor = arith.muli %i, %c16_i32 : i32
+    %row_base = arith.addi %major, %minor : i32
+    %idx_ptrs = tt.addptr %idx_base, %cols_2d : tensor<1x8x!tt.ptr<i32>>, tensor<1x8xi32>
+    %indices = tt.load %idx_ptrs : tensor<1x8x!tt.ptr<i32>>
+    %row_splat = tt.splat %row_base : i32 -> tensor<1x8xi32>
+    %offsets = arith.addi %row_splat, %indices : tensor<1x8xi32>
+    %ptrs = tt.addptr %src_base, %offsets : tensor<1x8x!tt.ptr<f32>>, tensor<1x8xi32>
+    %value = tt.load %ptrs : tensor<1x8x!tt.ptr<f32>>
+    %out_ptrs = tt.addptr %out_base, %cols_2d : tensor<1x8x!tt.ptr<f32>>, tensor<1x8xi32>
+    tt.store %out_ptrs, %value : tensor<1x8x!tt.ptr<f32>>
+  }
+  tt.return
+}
+
+// -----
+
+// The scalar row path measures the row advance against an enclosing scf.for.
+// With no loop there is no per-row counter to measure, so the width stays
+// unknown and the load is left alone.
+// CHECK-LABEL: @scalar_row_without_loop
+// CHECK-NOT: tt.gather
+// CHECK: tt.return
+tt.func @scalar_row_without_loop(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>,
+                                 %row: i32) -> tensor<1x8xf32> {
+  %c16_i32 = arith.constant 16 : i32
+  %cols = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32>
+  %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<8xi32> -> tensor<1x8xi32>
+  %row_base = arith.muli %row, %c16_i32 : i32
+  %idx_base = tt.splat %idx : !tt.ptr<i32> -> tensor<1x8x!tt.ptr<i32>>
+  %idx_ptrs = tt.addptr %idx_base, %cols_2d : tensor<1x8x!tt.ptr<i32>>, tensor<1x8xi32>
+  %indices = tt.load %idx_ptrs : tensor<1x8x!tt.ptr<i32>>
+  %row_splat = tt.splat %row_base : i32 -> tensor<1x8xi32>
+  %offsets = arith.addi %row_splat, %indices : tensor<1x8xi32>
+  %src_base = tt.splat %src : !tt.ptr<f32> -> tensor<1x8x!tt.ptr<f32>>
+  %ptrs = tt.addptr %src_base, %offsets : tensor<1x8x!tt.ptr<f32>>, tensor<1x8xi32>
+  %value = tt.load %ptrs : tensor<1x8x!tt.ptr<f32>>
+  tt.return %value : tensor<1x8xf32>
+}

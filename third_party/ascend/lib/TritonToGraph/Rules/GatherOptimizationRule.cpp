@@ -677,16 +677,26 @@ std::optional<int64_t> findFoldedUnitAxisDimension(Operation *searchRoot,
 // graph-optimize-gather-scalar-row.mlir).
 struct ScalarAxisMatch {
   int64_t dimension;
+  // Kept so the caller can confirm, once it knows the final source offset,
+  // that the constant beside this value really is the row stride.
+  Value carrier;
+  // The loop both coefficients must be measured against.
+  scf::ForOp loop;
 };
 
-std::optional<ScalarAxisMatch>
-findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
-                        ReadOnlyOffsetClassifier &classifier) {
+std::optional<ScalarAxisMatch> findScalarAxisDimension(Operation *searchRoot,
+                                                       Operation *indicesOp) {
+  // Unlike the tt.expand_dims-anchored search above, nothing here ties the
+  // constant structurally to the axis being sized, so the multiplicand has to
+  // carry that evidence instead: require a provable per-row advance, meaning a
+  // nonzero affine coefficient of the enclosing loop's induction variable.
+  // That is exactly the shape this path exists for, one row per scf.for
+  // iteration. Without a loop there is no per-row counter to find.
+  auto loop = searchRoot->getParentOfType<scf::ForOp>();
+  if (!loop)
+    return std::nullopt;
+  DenseMap<Value, std::optional<uint64_t>> cache;
   // Scalar only, so gatherAxis's own tensor-typed MulI can't shadow this.
-  // The non-constant operand must not be scalarLike either: a tile-bound
-  // computation like "program_id * row_blk" is scalarLike (pure program_id
-  // and constants), while the real per-row counter always incorporates
-  // something that genuinely varies per row, which is never scalarLike.
   std::function<bool(Operation *)> isMulIWithConstant =
       [&](Operation *op) -> bool {
     auto mulI = dyn_cast<arith::MulIOp>(op);
@@ -699,7 +709,8 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
     if (!rhsIsConst && !lhsIsConst)
       return false;
     Value carrier = rhsIsConst ? mulI.getLhs() : mulI.getRhs();
-    return !classifier.classify(carrier).isScalarLike();
+    auto coefficient = rowIvCoefficient(carrier, loop, cache);
+    return coefficient && *coefficient > 0;
   };
   // Also stop outside searchRoot's own block (e.g. a hoisted loop-tile bound).
   std::function<bool(Operation *)> leavesSourceRegion =
@@ -715,7 +726,10 @@ findScalarAxisDimension(Operation *searchRoot, Operation *indicesOp,
   std::optional<int64_t> dim = extractMulIConstant(mulI);
   if (!dim)
     return std::nullopt;
-  return ScalarAxisMatch{*dim};
+  Value carrier = mulI.getRhs().getDefiningOp<arith::ConstantOp>()
+                      ? mulI.getLhs()
+                      : mulI.getRhs();
+  return ScalarAxisMatch{*dim, carrier, loop};
 }
 
 // Matches a tt.load against the gather pattern and recovers its shape,
@@ -878,6 +892,7 @@ analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
   // establish the allocation size of the raw source pointer.
   // Axis 0 (the row dimension) comes from the indices' own shape.
   candidate.srcShape.push_back(indexShape[0]);
+  std::optional<ScalarAxisMatch> scalarRowMatch;
   for (int axis = 1; axis < candidate.indexRank; axis++) {
     AxisDimensionResult axisDimension =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
@@ -894,9 +909,10 @@ analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
     if (axisDimension.status == AxisDimensionStatus::Found)
       dim = axisDimension.dimension;
     if (!dim && axis == 1) {
-      if (std::optional<ScalarAxisMatch> scalarMatch = findScalarAxisDimension(
-              srcAnalysisStart, indicesOp, classifier)) {
+      if (std::optional<ScalarAxisMatch> scalarMatch =
+              findScalarAxisDimension(srcAnalysisStart, indicesOp)) {
         dim = scalarMatch->dimension;
+        scalarRowMatch = scalarMatch;
       }
     }
     if (!dim)
@@ -942,6 +958,41 @@ analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
       findAxisInvariantValue(base, candidate.srcShape, candidate.gatherAxis);
   if (!candidate.sourceBase)
     return std::nullopt;
+
+  // A per-row carrier only shows that the scalar row path found *a* row
+  // counter, not that the constant beside it is the row stride. Now that the
+  // final source offset is known, require it to advance by exactly one row per
+  // carrier step. A shape like "row * 1024 + row * 16" advances by 1040 and is
+  // not a 1024-wide row, so reading 1024 elements from it would reach into a
+  // neighbouring row. Unanalyzable arithmetic cannot establish that either, so
+  // decline it too.
+  //
+  // One row spans every dimension below axis 0, not just the axis the scalar
+  // path recovered: a rank-3 [R, d1, d2] source advances by d1 * d2 per row.
+  // Comparing against the recovered axis alone would reject every well formed
+  // rank-3 candidate and would check a dimension other than the gather axis,
+  // whose width is what the bounds and the source read are built from.
+  if (scalarRowMatch) {
+    uint64_t rowStride = 1;
+    bool strideKnown = true;
+    for (size_t d = 1; d < candidate.srcShape.size(); d++)
+      strideKnown &= checkedMulU64(
+          rowStride, static_cast<uint64_t>(candidate.srcShape[d]), rowStride);
+    DenseMap<Value, std::optional<uint64_t>> cache;
+    std::optional<uint64_t> baseAdvance =
+        rowIvCoefficient(candidate.sourceBase, scalarRowMatch->loop, cache);
+    std::optional<uint64_t> carrierAdvance =
+        rowIvCoefficient(scalarRowMatch->carrier, scalarRowMatch->loop, cache);
+    uint64_t expected = 0;
+    if (!strideKnown || !baseAdvance || !carrierAdvance ||
+        !checkedMulU64(*carrierAdvance, rowStride, expected) ||
+        *baseAdvance != expected) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[GatherOptimization] scalar row stride does not match the "
+                    "source offset's per-iteration advance\n");
+      return std::nullopt;
+    }
+  }
 
   if (Value mask = loadOp.getMask()) {
     candidate.sourceMask =
