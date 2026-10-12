@@ -216,28 +216,13 @@ def test_gather_target_eligibility(tmp_path, arch, expected):
     assert ("gather.optimised.load" in result) == expected
 
 
-@pytest.mark.parametrize("lower,upper,step,dependency,expected", [
-    (0, 4, 2, "row", False),
-    (128, 132, 2, "row", False),  # two iterations, previously estimated as 66
-    (128, 161, 2, "row", True),  # ceil(33 / 2) = 17, not 16
-    (128, 160, 2, "row", False),  # exactly 16 iterations
-    (128, 260, 2, "row", True),
-    (-128, -124, 2, "row", False),
-    (-128, 4, 2, "row", True),
-    (132, 128, 2, "row", False),
-    (128, 128, 2, "row", False),
-    (None, 260, 2, "row", False),
-    (0, None, 2, "row", False),
-    (0, 256, 4, "row", False),  # loop step differs from the two-row tile
-    (0, 256, 2, "unrelated", False),
-    (0, 256, 2, "cancelled", False),
-    (0, 256, 2, "nonlinear", False),
-])
-def test_gather_row_loop_iterations(tmp_path, lower, upper, step, dependency, expected):
-    # FP32 source width 16 and index width 2: thresholds are 4 for <= 4
-    # iterations, 3 for <= 16, and 2 for >= 17. The input contains only
-    # indirect source reads, so it also exercises the original Gather pattern.
-    text = gather_fixture().replace("2x8x", "2x2x")
+def gather_width_one_loop_fixture(lower, upper, step, dependency, *, value_type="f16", idx_width=32, row_step=2):
+    text = gather_fixture().replace("2x8x", f"2x{idx_width}x").replace("f32", value_type)
+    text = re.sub(r"tensor<2(?=x)", f"tensor<{row_step}", text)
+    text = text.replace("end = 5 : i32", f"end = {3 + row_step} : i32")
+    text = text.replace(f"dense<16> : tensor<{row_step}x1xi32>",
+                        f"dense<1> : tensor<{row_step}x1xi32>")
+    tile_type = f"tensor<{row_step}x{idx_width}x{value_type}>"
     header, body = text.split("{\n", 1)
     text = header.replace("%src:", "%dynamic_lower: i32, %dynamic_upper: i32, %src:") + "{\n"
     lower_name, upper_name = "%dynamic_lower", "%dynamic_upper"
@@ -248,10 +233,10 @@ def test_gather_row_loop_iterations(tmp_path, lower, upper, step, dependency, ex
         text += f"  %upper = arith.constant {upper} : i32\n"
         upper_name = "%upper"
     text += f"  %step = arith.constant {step} : i32\n"
-    text += "  %init = arith.constant dense<0.0> : tensor<2x2xf32>\n"
+    text += f"  %init = arith.constant dense<0.0> : {tile_type}\n"
     text += (f"  %result = scf.for %iv = {lower_name} to {upper_name} step %step "
              "iter_args(%previous = %init) "
-             "-> (tensor<2x2xf32>) : i32 {\n")
+             f"-> ({tile_type}) : i32 {{\n")
     if dependency != "unrelated":
         carrier = "%iv"
         if dependency == "cancelled":
@@ -263,10 +248,66 @@ def test_gather_row_loop_iterations(tmp_path, lower, upper, step, dependency, ex
         text += f"  %row_bias = arith.addi %bias, {carrier} : i32\n"
         body = body.replace("tt.splat %bias :", "tt.splat %row_bias :")
     body = body.replace("tt.return %value", "scf.yield %value")
-    text += body + "\n  tt.return %result : tensor<2x2xf32>\n}"
+    return text + body + f"\n  tt.return %result : {tile_type}\n}}"
+
+
+@pytest.mark.parametrize("value_type", ["f16", "bf16"])
+@pytest.mark.parametrize("lower,upper,step,dependency,expected", [
+    (0, 4, 2, "row", False),
+    (128, 132, 2, "row", False),  # two iterations, not upper / step = 66
+    (128, 137, 2, "row", True),  # ceil(9 / 2) = 5, not 4
+    (128, 136, 2, "row", False),  # exactly four iterations
+    (128, 260, 2, "row", True),
+    (-128, -124, 2, "row", False),
+    (-128, -119, 2, "row", True),
+    (132, 128, 2, "row", False),
+    (128, 128, 2, "row", False),
+    (None, 260, 2, "row", False),
+    (0, None, 2, "row", False),
+    (0, 256, 4, "row", False),  # loop step differs from the two-row tile
+    (0, 256, 2, "unrelated", False),
+    (0, 256, 2, "cancelled", False),
+    (0, 256, 2, "nonlinear", False),
+])
+def test_gather_row_loop_iterations(tmp_path, value_type, lower, upper, step, dependency, expected):
+    # Width-1 half types retain T >= 5. Unknown bounds or unproven row
+    # dependence fall back to T=1, even when the enclosing loop is long.
+    text = gather_width_one_loop_fixture(lower, upper, step, dependency, value_type=value_type)
     result = run_gather_pass(tmp_path, text)
     assert ("tt.gather" in result) == expected
     assert ("gather.optimised.load" in result) == expected
+
+
+@pytest.mark.parametrize("row_step", [1, 2])
+@pytest.mark.parametrize("value_type,idx_width,iterations,expected", [
+    ("f32", 8, 16, False),  # Keep the width-1 minimum index width.
+    ("f32", 16, 0, False),
+    ("f32", 16, 4, True),
+    ("f32", 17, 17, False),  # A longer loop cannot bypass alignment.
+    ("f32", 19, 16, False),
+    ("f32", 32, 16, True),
+    ("f32", 33, 16, False),
+    ("f32", 33, 128, False),
+    ("f16", 16, 16, False),
+    ("f16", 32, 4, False),
+    ("f16", 32, 5, True),
+    ("f16", 33, 16, False),
+    ("f16", 40, 16, False),  # FP16 requires a multiple of 16.
+    ("f16", 64, 128, True),
+    ("bf16", 24, 16, False),
+    ("bf16", 32, 4, False),
+    ("bf16", 32, 5, True),
+    ("bf16", 33, 16, False),
+    ("bf16", 40, 16, True),  # Policy regression, not an NPU performance claim.
+    ("bf16", 64, 128, True),
+])
+def test_gather_width_one_benefit(tmp_path, row_step, value_type, idx_width, iterations, expected):
+    text = gather_width_one_loop_fixture(0, iterations * row_step, row_step, "row", value_type=value_type,
+                                         idx_width=idx_width, row_step=row_step)
+    result = run_gather_pass(tmp_path, text)
+    assert ("tt.gather" in result) == expected
+    assert ('gather.optimised.load = "source"' in result) == expected
+    assert ('gather.optimised.load = "fallback"' in result) == expected
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
@@ -287,7 +328,8 @@ def test_gather_rule_npu_semantics(monkeypatch, dtype, case):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("Ascend NPU is unavailable")
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
-    width, k, row_blk = 16, 8, 8
+    # FP16 uses its measured 16-element boundary; FP32/BF16 use 8.
+    width, k, row_blk = 16, (16 if dtype == "float16" else 8), 8
     n_rows = 0 if case == "all_masked" else 7
     # Keep raw negative accesses valid even when the index is below -width.
     base_row = 2 if case == "negative_below_bound" else 1

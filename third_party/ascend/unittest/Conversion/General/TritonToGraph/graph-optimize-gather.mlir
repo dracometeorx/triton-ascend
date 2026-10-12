@@ -103,4 +103,257 @@ module attributes {hacc.target = #hacc.target<"Ascend910B3">} {
     }
     tt.return
   }
+
+  // Profitability admission boundaries for source widths greater than one.
+  // rowStep == 1 does not bypass the dtype-specific gate.
+
+  // CHECK-LABEL: @f32_row_step_one_idx4
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f32_row_step_one_idx4(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>) -> tensor<1x4xf32> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<4> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x4xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x4x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x4x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x4xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<1x4x!tt.ptr<f32>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x4x!tt.ptr<f32>>, tensor<1x4xi32>
+    %value = tt.load %ptrs : tensor<1x4x!tt.ptr<f32>>
+    tt.return %value : tensor<1x4xf32>
+  }
+
+  // FP32 rejects the lower neighbor.
+
+  // CHECK-LABEL: @f32_idx7
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f32_idx7(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>) -> tensor<1x7xf32> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x7xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x7x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x7x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x7xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<1x7x!tt.ptr<f32>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x7x!tt.ptr<f32>>, tensor<1x7xi32>
+    %value = tt.load %ptrs : tensor<1x7x!tt.ptr<f32>>
+    tt.return %value : tensor<1x7xf32>
+  }
+
+  // FP32 accepts a 32-byte index row.
+
+  // CHECK-LABEL: @f32_idx8
+  // CHECK: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f32_idx8(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>) -> tensor<1x8xf32> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x8xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x8x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x8x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x8xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<1x8x!tt.ptr<f32>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x8x!tt.ptr<f32>>, tensor<1x8xi32>
+    %value = tt.load %ptrs : tensor<1x8x!tt.ptr<f32>>
+    tt.return %value : tensor<1x8xf32>
+  }
+
+  // FP32 rejects the upper neighbor.
+
+  // CHECK-LABEL: @f32_idx9
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f32_idx9(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>) -> tensor<1x9xf32> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x9xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x9x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x9x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x9xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<1x9x!tt.ptr<f32>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x9x!tt.ptr<f32>>, tensor<1x9xi32>
+    %value = tt.load %ptrs : tensor<1x9x!tt.ptr<f32>>
+    tt.return %value : tensor<1x9xf32>
+  }
+
+  // BF16 rejects the lower neighbor.
+
+  // CHECK-LABEL: @bf16_idx7
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @bf16_idx7(%src: !tt.ptr<bf16>, %idx: !tt.ptr<i32>) -> tensor<1x7xbf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x7xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x7x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x7x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x7xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<bf16> -> tensor<1x7x!tt.ptr<bf16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x7x!tt.ptr<bf16>>, tensor<1x7xi32>
+    %value = tt.load %ptrs : tensor<1x7x!tt.ptr<bf16>>
+    tt.return %value : tensor<1x7xbf16>
+  }
+
+  // BF16 accepts eight indices.
+
+  // CHECK-LABEL: @bf16_idx8
+  // CHECK: tt.gather
+  // CHECK: tt.return
+
+  tt.func @bf16_idx8(%src: !tt.ptr<bf16>, %idx: !tt.ptr<i32>) -> tensor<1x8xbf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x8xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x8x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x8x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x8xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<bf16> -> tensor<1x8x!tt.ptr<bf16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x8x!tt.ptr<bf16>>, tensor<1x8xi32>
+    %value = tt.load %ptrs : tensor<1x8x!tt.ptr<bf16>>
+    tt.return %value : tensor<1x8xbf16>
+  }
+
+  // BF16 rejects the upper neighbor.
+
+  // CHECK-LABEL: @bf16_idx9
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @bf16_idx9(%src: !tt.ptr<bf16>, %idx: !tt.ptr<i32>) -> tensor<1x9xbf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x9xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x9x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x9x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x9xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<bf16> -> tensor<1x9x!tt.ptr<bf16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x9x!tt.ptr<bf16>>, tensor<1x9xi32>
+    %value = tt.load %ptrs : tensor<1x9x!tt.ptr<bf16>>
+    tt.return %value : tensor<1x9xbf16>
+  }
+
+  // BF16 accepts every 8-index boundary, including 24.
+
+  // CHECK-LABEL: @bf16_idx24
+  // CHECK: tt.gather
+  // CHECK: tt.return
+
+  tt.func @bf16_idx24(%src: !tt.ptr<bf16>, %idx: !tt.ptr<i32>) -> tensor<1x24xbf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x24xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x24x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x24x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x24xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<bf16> -> tensor<1x24x!tt.ptr<bf16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x24x!tt.ptr<bf16>>, tensor<1x24xi32>
+    %value = tt.load %ptrs : tensor<1x24x!tt.ptr<bf16>>
+    tt.return %value : tensor<1x24xbf16>
+  }
+
+  // FP16 rejects the measured 8-index boundary.
+
+  // CHECK-LABEL: @f16_idx8
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f16_idx8(%src: !tt.ptr<f16>, %idx: !tt.ptr<i32>) -> tensor<1x8xf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x8xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x8x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x8x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x8xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f16> -> tensor<1x8x!tt.ptr<f16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x8x!tt.ptr<f16>>, tensor<1x8xi32>
+    %value = tt.load %ptrs : tensor<1x8x!tt.ptr<f16>>
+    tt.return %value : tensor<1x8xf16>
+  }
+
+  // FP16 accepts the measured 16-index boundary.
+
+  // CHECK-LABEL: @f16_idx16
+  // CHECK: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f16_idx16(%src: !tt.ptr<f16>, %idx: !tt.ptr<i32>) -> tensor<1x16xf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x16xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x16x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x16x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x16xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f16> -> tensor<1x16x!tt.ptr<f16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x16x!tt.ptr<f16>>, tensor<1x16xi32>
+    %value = tt.load %ptrs : tensor<1x16x!tt.ptr<f16>>
+    tt.return %value : tensor<1x16xf16>
+  }
+
+  // FP16 rejects the next 8-only boundary.
+
+  // CHECK-LABEL: @f16_idx24
+  // CHECK-NOT: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f16_idx24(%src: !tt.ptr<f16>, %idx: !tt.ptr<i32>) -> tensor<1x24xf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x24xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x24x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x24x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x24xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f16> -> tensor<1x24x!tt.ptr<f16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x24x!tt.ptr<f16>>, tensor<1x24xi32>
+    %value = tt.load %ptrs : tensor<1x24x!tt.ptr<f16>>
+    tt.return %value : tensor<1x24xf16>
+  }
+
+  // FP16 accepts the next 16-index boundary.
+
+  // CHECK-LABEL: @f16_idx32
+  // CHECK: tt.gather
+  // CHECK: tt.return
+
+  tt.func @f16_idx32(%src: !tt.ptr<f16>, %idx: !tt.ptr<i32>) -> tensor<1x32xf16> {
+    %rows = tt.make_range {start = 0 : i32, end = 1 : i32} : tensor<1xi32>
+    %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+    %width = arith.constant dense<8> : tensor<1x1xi32>
+    %base = arith.muli %expanded, %width : tensor<1x1xi32>
+    %base_grid = tt.broadcast %base : tensor<1x1xi32> -> tensor<1x32xi32>
+    %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<1x32x!tt.ptr<i32>>
+    %indices = tt.load %idx_ptrs : tensor<1x32x!tt.ptr<i32>>
+    %offsets = arith.addi %base_grid, %indices : tensor<1x32xi32>
+    %src_ptrs = tt.splat %src : !tt.ptr<f16> -> tensor<1x32x!tt.ptr<f16>>
+    %ptrs = tt.addptr %src_ptrs, %offsets : tensor<1x32x!tt.ptr<f16>>, tensor<1x32xi32>
+    %value = tt.load %ptrs : tensor<1x32x!tt.ptr<f16>>
+    tt.return %value : tensor<1x32xf16>
+  }
 }
