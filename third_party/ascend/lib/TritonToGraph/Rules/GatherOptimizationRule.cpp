@@ -599,10 +599,29 @@ int64_t findRowIterations(Operation *anchor, Value sourceBase,
   return constantTripCount(*lower, *upper, *step);
 }
 
+// Why "no multiplier" and "non-constant multiplier" must stay distinct: the
+// unit-dimension fallback below is only sound for the former, where the stride
+// canonicalized away as arith.muli(x, 1). A non-constant multiplier is a
+// runtime row stride whose width cannot be recovered at compile time, so
+// folding it to 1 would both mis-size the source tile and wrap negative
+// indices against the wrong width.
+enum class AxisDimensionStatus {
+  // No arith.muli is anchored on this axis's tt.expand_dims.
+  NoMultiplier,
+  // An axis multiplier exists, but its multiplicand is not a constant.
+  NonConstantMultiplier,
+  Found,
+};
+
+struct AxisDimensionResult {
+  AxisDimensionStatus status;
+  int64_t dimension = 0;
+};
+
 // Searches backward from searchRoot (anchored on the pointer side), so a
 // tt.expand_dims shared with the indices side is never ambiguous.
-std::optional<int64_t> findAxisDimension(Operation *searchRoot,
-                                         Operation *indicesOp, int64_t axis) {
+AxisDimensionResult findAxisDimension(Operation *searchRoot,
+                                      Operation *indicesOp, int64_t axis) {
   auto isAxisExpandDims = [axis](Value v) -> bool {
     auto expandDims = v.getDefiningOp<triton::ExpandDimsOp>();
     return expandDims && static_cast<int64_t>(expandDims.getAxis()) == axis;
@@ -621,8 +640,12 @@ std::optional<int64_t> findAxisDimension(Operation *searchRoot,
   Operation *mulI = findOperandDefinitionWithCondition(
       searchRoot->getResult(0), isMulIOfThisAxis, leavesSourceRegion);
   if (!mulI)
-    return std::nullopt;
-  return extractMulIConstant(cast<arith::MulIOp>(mulI));
+    return {AxisDimensionStatus::NoMultiplier};
+  std::optional<int64_t> dimension =
+      extractMulIConstant(cast<arith::MulIOp>(mulI));
+  if (!dimension)
+    return {AxisDimensionStatus::NonConstantMultiplier};
+  return {AxisDimensionStatus::Found, *dimension};
 }
 
 // Last resort: an unmultiplied tt.expand_dims means its multiplier
@@ -852,8 +875,20 @@ analyzeGatherCandidate(triton::LoadOp loadOp, unsigned ubCapacityBytes) {
   // Axis 0 (the row dimension) comes from the indices' own shape.
   candidate.srcShape.push_back(indexShape[0]);
   for (int axis = 1; axis < candidate.indexRank; axis++) {
-    std::optional<int64_t> dim =
+    AxisDimensionResult axisDimension =
         findAxisDimension(srcAnalysisStart, indicesOp, axis);
+    if (axisDimension.status == AxisDimensionStatus::NonConstantMultiplier) {
+      // A runtime row stride: neither the scalar nor the unit-dimension
+      // fallback can recover the real width, so decline the candidate the way
+      // PR #1027 did instead of guessing.
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[GatherOptimization] non-constant multiplier for axis "
+                 << axis << "\n");
+      return std::nullopt;
+    }
+    std::optional<int64_t> dim;
+    if (axisDimension.status == AxisDimensionStatus::Found)
+      dim = axisDimension.dimension;
     if (!dim && axis == 1) {
       if (std::optional<ScalarAxisMatch> scalarMatch = findScalarAxisDimension(
               srcAnalysisStart, indicesOp, classifier)) {

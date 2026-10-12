@@ -306,3 +306,30 @@ tt.func @opaque_tensor_offsets(%src: !tt.ptr<f32>, %offsets: tensor<2x8xi32>, %b
   %result = tt.load %addresses : tensor<2x8x!tt.ptr<f32>>
   tt.return %result : tensor<2x8xf32>
 }
+
+// -----
+
+// A runtime row stride leaves the source width unknown, so the axis multiplier
+// must not fall back to a unit dimension: sizing the source tile at width 1
+// would also wrap negative indices against the wrong width.
+// The 16 indices are deliberate. Folding the stride to a unit dimension leaves
+// a width-1 f32 source, which the benefit gate admits only from 16 indices up,
+// so a narrower tile would be declined for that reason instead and the case
+// would pass whether or not the multiplier is rejected.
+// CHECK-LABEL: @runtime_row_stride
+// CHECK-NOT: tt.gather
+// CHECK: tt.return
+tt.func @runtime_row_stride(%src: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %stride: i32) -> tensor<2x16xf32> {
+  %rows = tt.make_range {start = 3 : i32, end = 5 : i32} : tensor<2xi32>
+  %expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<2xi32> -> tensor<2x1xi32>
+  %width = tt.splat %stride : i32 -> tensor<2x1xi32>
+  %base = arith.muli %expanded, %width : tensor<2x1xi32>
+  %base_grid = tt.broadcast %base : tensor<2x1xi32> -> tensor<2x16xi32>
+  %idx_ptrs = tt.splat %idx : !tt.ptr<i32> -> tensor<2x16x!tt.ptr<i32>>
+  %indices = tt.load %idx_ptrs : tensor<2x16x!tt.ptr<i32>>
+  %offsets = arith.addi %base_grid, %indices : tensor<2x16xi32>
+  %src_ptrs = tt.splat %src : !tt.ptr<f32> -> tensor<2x16x!tt.ptr<f32>>
+  %ptrs = tt.addptr %src_ptrs, %offsets : tensor<2x16x!tt.ptr<f32>>, tensor<2x16xi32>
+  %value = tt.load %ptrs : tensor<2x16x!tt.ptr<f32>>
+  tt.return %value : tensor<2x16xf32>
+}
