@@ -220,8 +220,7 @@ def gather_width_one_loop_fixture(lower, upper, step, dependency, *, value_type=
     text = gather_fixture().replace("2x8x", f"2x{idx_width}x").replace("f32", value_type)
     text = re.sub(r"tensor<2(?=x)", f"tensor<{row_step}", text)
     text = text.replace("end = 5 : i32", f"end = {3 + row_step} : i32")
-    text = text.replace(f"dense<16> : tensor<{row_step}x1xi32>",
-                        f"dense<1> : tensor<{row_step}x1xi32>")
+    text = text.replace(f"dense<16> : tensor<{row_step}x1xi32>", f"dense<1> : tensor<{row_step}x1xi32>")
     tile_type = f"tensor<{row_step}x{idx_width}x{value_type}>"
     header, body = text.split("{\n", 1)
     text = header.replace("%src:", "%dynamic_lower: i32, %dynamic_upper: i32, %src:") + "{\n"
