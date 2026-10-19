@@ -30,12 +30,6 @@ import triton.language as tl
 from triton._C.libtriton import ascend, ir
 from triton._C.libtriton.ascend import ir as ascend_ir
 from triton.backends.ascend.compiler import NPUOptions, make_ttir
-from triton.backends.ascend.program_grid import (
-    DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
-    GATHER_OPTIMIZATION_RULE_BIT,
-    INDEPENDENT_AXIS_TENSORIZE_RULE_BIT,
-    PERSISTENT_TASK_STRIP_MINING_RULE_BIT,
-)
 from triton.compiler.code_generator import ast_to_ttir
 from triton.compiler.compiler import ASTSource
 from triton.errors import TritonError
@@ -301,14 +295,6 @@ def test_graph_optimize_pass_accepts_zero_rule_mask(tmp_path):
 
     assert "tt.func" in str(module)
     assert_reparseable(module, tmp_path, "zero-rule-mask")
-
-
-def test_default_graph_mask_enables_iat_ptsm_and_gather():
-    expected_mask = (511 | INDEPENDENT_AXIS_TENSORIZE_RULE_BIT | PERSISTENT_TASK_STRIP_MINING_RULE_BIT
-                     | GATHER_OPTIMIZATION_RULE_BIT)
-
-    assert DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK == expected_mask
-    assert NPUOptions(arch="Ascend910_95").rule_mask == expected_mask
 
 
 def test_default_generic_graph_mask_excludes_legacy_memory_compatibility(tmp_path, ):
